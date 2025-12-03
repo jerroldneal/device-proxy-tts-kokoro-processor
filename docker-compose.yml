@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  tts-kokoro-processor:
+    build: .
+    container_name: tts-kokoro-processor-instance
+    volumes:
+      - c:/.tts:/app/data
+      - kokoro_hf_cache:/root/.cache/huggingface
+      - ./processor.py:/app/processor.py
+    env_file:
+      - .env
+    restart: unless-stopped
+
+volumes:
+  kokoro_hf_cache:
