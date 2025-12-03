@@ -74,8 +74,8 @@ class StreamPlayer:
             f"--demuxer-rawaudio-rate={self.sample_rate}",
             "--demuxer-rawaudio-channels=1",
             "--demuxer-rawaudio-format=floatle",
-            # Loudnorm removed to reduce buffering latency
-            # "--af=loudnorm=I=-16:TP=-1.5:LRA=11",
+            # Loudnorm for consistent volume (EBU R128)
+            "--af=loudnorm=I=-16:TP=-1.5:LRA=11",
             "-"
         ]
         print("StreamPlayer: Starting MPV process...")
