@@ -54,67 +54,76 @@ class AudioChunk:
         self.source_file = source_file
         self.is_end_of_file = is_end_of_file
 
-class StreamPlayer:
-    def __init__(self, sample_rate=24000):
+class PipePlayer:
+    def __init__(self, pipe_path="/tmp/audio_pipe", sample_rate=24000, target_rate=48000):
+        self.pipe_path = pipe_path
         self.sample_rate = sample_rate
-        self.process = None
-        self.start_process()
+        self.target_rate = target_rate
+        self.pipe = None
+        # Don't block init, connect on first write
 
-    def start_process(self):
-        if self.process:
-            self.stop_process()
+    def connect_pipe(self):
+        if self.pipe:
+            try: self.pipe.close()
+            except: pass
+            self.pipe = None
 
-        # MPV command to read raw PCM float32 from stdin
-        cmd = [
-            "mpv",
-            "--no-video",
-            "--no-cache",
-            "--no-terminal",
-            "--demuxer=rawaudio",
-            f"--demuxer-rawaudio-rate={self.sample_rate}",
-            "--demuxer-rawaudio-channels=1",
-            "--demuxer-rawaudio-format=floatle",
-            # Loudnorm for consistent volume (EBU R128)
-            "--af=loudnorm=I=-16:TP=-1.5:LRA=11",
-            "-"
-        ]
-        print("StreamPlayer: Starting MPV process...")
+        if not os.path.exists(self.pipe_path):
+            # Wait for proxy to create it
+            return False
+
         try:
-            self.process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            # Open for writing. This blocks until a reader is connected.
+            # Since we are in a worker thread, blocking is acceptable but we should timeout?
+            # Python open() doesn't support timeout.
+            # We rely on the proxy being up.
+            print(f"PipePlayer: Opening {self.pipe_path}...")
+            self.pipe = open(self.pipe_path, 'wb')
+            print("PipePlayer: Connected.")
+            return True
         except Exception as e:
-            print(f"StreamPlayer: Failed to start MPV: {e}")
-
-    def stop_process(self):
-        if self.process:
-            try:
-                self.process.stdin.close()
-                self.process.terminate()
-                self.process.wait(timeout=2)
-            except:
-                pass
-            self.process = None
+            print(f"PipePlayer: Failed to open pipe: {e}")
+            self.pipe = None
+            return False
 
     def play_chunk(self, audio_data, volume=100):
-        if not self.process or self.process.poll() is not None:
-            print("StreamPlayer: MPV died, restarting...")
-            self.start_process()
+        if self.pipe is None:
+            if not self.connect_pipe():
+                # If we can't connect, we drop the chunk to avoid hanging forever?
+                # Or we retry?
+                time.sleep(0.1)
+                return
+
+        # Resample 24k -> 48k
+        if self.target_rate == 48000 and self.sample_rate == 24000:
+            # Linear interpolation
+            x = np.arange(len(audio_data))
+            x_new = np.arange(0, len(audio_data), 0.5)
+            # Note: x_new might be slightly larger/smaller depending on float precision,
+            # but np.interp handles it.
+            # Actually, x_new length should be exactly 2x.
+            # Let's use linspace for exactness?
+            # No, arange is fine.
+            audio_data = np.interp(x_new, x, audio_data)
+
+        # Apply volume
+        audio_data = audio_data * (volume / 100.0)
+
+        # Clip
+        audio_data = np.clip(audio_data, -1.0, 1.0)
+
+        # Convert to Int16
+        audio_int16 = (audio_data * 32767).astype(np.int16)
 
         try:
-            # Apply volume scaling (0.0 to 1.0+)
-            vol_factor = volume / 100.0
-            scaled_data = audio_data * vol_factor
-
-            # Ensure float32
-            if scaled_data.dtype != np.float32:
-                scaled_data = scaled_data.astype(np.float32)
-
-            self.process.stdin.write(scaled_data.tobytes())
-            self.process.stdin.flush()
+            self.pipe.write(audio_int16.tobytes())
+            self.pipe.flush()
         except BrokenPipeError:
-            print("StreamPlayer: Broken pipe, restarting...")
-            self.start_process()
+            print("PipePlayer: Broken pipe. Reconnecting...")
+            self.connect_pipe()
         except Exception as e:
-            print(f"StreamPlayer: Error writing to MPV: {e}")
+            print(f"PipePlayer: Write error: {e}")
+            self.connect_pipe()
 
 class QueueHandler(FileSystemEventHandler):
     def on_created(self, event):
@@ -236,7 +245,7 @@ def generator_worker():
             time.sleep(1)
 
 def player_worker():
-    player = StreamPlayer()
+    player = PipePlayer()
 
     while True:
         try:
