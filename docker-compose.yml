@@ -13,6 +13,8 @@ services:
       # - ../pipes/audio-driver-proxy/forward_pipe_shim.sh:/app/forward_pipe.sh
     env_file:
       - .env
+    ports:
+      - "3021:3000"
     restart: unless-stopped
 
 volumes:
