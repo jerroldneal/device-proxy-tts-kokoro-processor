@@ -9,8 +9,8 @@ services:
       - kokoro_hf_cache:/root/.cache/huggingface
       - ./processor.py:/app/processor.py
       # Hot-swap the audio proxy with the Python version
-      - ../pipes/audio-driver-proxy/forward_pipe.py:/app/forward_pipe.py
-      - ../pipes/audio-driver-proxy/forward_pipe_shim.sh:/app/forward_pipe.sh
+      # - ../pipes/audio-driver-proxy/forward_pipe.py:/app/forward_pipe.py
+      # - ../pipes/audio-driver-proxy/forward_pipe_shim.sh:/app/forward_pipe.sh
     env_file:
       - .env
     restart: unless-stopped
