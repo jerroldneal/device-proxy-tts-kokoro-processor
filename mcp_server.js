@@ -2,6 +2,11 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { spawn } from "child_process";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const processorPath = path.join(__dirname, "processor.py");
 
 const server = new McpServer({
   name: "tts-kokoro-processor-mcp",
@@ -10,7 +15,7 @@ const server = new McpServer({
 
 // Spawn the Python processor
 // -u: Unbuffered stdout/stderr
-const python = spawn("python", ["-u", "processor.py"]);
+const python = spawn("python", ["-u", processorPath], { cwd: __dirname });
 
 // Handle Python output
 // We redirect Python's stdout/stderr to stderr so it doesn't interfere with MCP Stdio transport
