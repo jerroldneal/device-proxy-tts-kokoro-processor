@@ -15,7 +15,12 @@ RUN apt-get update && apt-get install -y \
     libsndfile1 \
     git \
     mpv \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js (LTS)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs
 
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
@@ -28,6 +33,10 @@ RUN uv pip install --system --no-cache -r requirements.txt
 
 # 3. Copy application source
 COPY processor.py .
+COPY package.json .
+RUN npm install
+COPY mcp_server.js .
+COPY --chmod=0755 start.sh .
 
 # Create data directories
 RUN mkdir -p /app/data/todo /app/data/working /app/data/done
@@ -36,4 +45,4 @@ RUN mkdir -p /app/data/todo /app/data/working /app/data/done
 VOLUME ["/app/data", "/root/.cache/huggingface"]
 
 # Start the processor
-CMD ["python", "-u", "processor.py"]
+CMD ["./start.sh"]

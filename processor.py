@@ -19,6 +19,8 @@ from watchdog.events import FileSystemEventHandler
 import threading
 import queue
 import re
+import sys
+import json
 
 # Configuration
 DATA_DIR = "/app/data"
@@ -40,18 +42,19 @@ VALID_VOICES = {
 pipeline = None
 
 # Queues
-file_queue = queue.Queue()
+# task_queue holds either file paths (str) or dicts (memory tasks)
+task_queue = queue.Queue()
 audio_queue = queue.Queue()
 
 # Event to wake up the file watcher
 fs_event = threading.Event()
 
 class AudioChunk:
-    def __init__(self, audio_data, sample_rate, volume, source_file, is_end_of_file=False):
+    def __init__(self, audio_data, sample_rate, volume, source_id, is_end_of_file=False):
         self.audio_data = audio_data
         self.sample_rate = sample_rate
         self.volume = volume
-        self.source_file = source_file
+        self.source_id = source_id
         self.is_end_of_file = is_end_of_file
 
 class PipePlayer:
@@ -168,26 +171,43 @@ def get_oldest_file(directory):
 def generator_worker():
     while True:
         try:
-            file_path = file_queue.get()
+            task = task_queue.get()
 
-            if not os.path.exists(file_path):
-                print(f"Generator: File {file_path} not found. Skipping.")
-                file_queue.task_done()
-                continue
+            # Determine if task is file path or memory object
+            is_file = isinstance(task, str)
+            source_id = task if is_file else "memory_task"
+            text = ""
 
-            print(f"Generator: Processing {file_path}")
+            if is_file:
+                file_path = task
+                if not os.path.exists(file_path):
+                    print(f"Generator: File {file_path} not found. Skipping.")
+                    task_queue.task_done()
+                    continue
 
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    text = f.read().strip()
-            except Exception as e:
-                print(f"Generator: Error reading file: {e}")
-                file_queue.task_done()
-                continue
+                print(f"Generator: Processing file {file_path}")
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        text = f.read().strip()
+                except Exception as e:
+                    print(f"Generator: Error reading file: {e}")
+                    task_queue.task_done()
+                    continue
+            else:
+                # Memory task
+                print("Generator: Processing memory task")
+                text = task.get('text', '')
+                # Prepend voice/speed tags if present in task object
+                voice = task.get('voice')
+                speed = task.get('speed')
+                prefix = ""
+                if voice: prefix += f"{{voice:{voice}}} "
+                if speed: prefix += f"{{speed:{speed}}} "
+                text = prefix + text
 
             if not text:
-                audio_queue.put(AudioChunk(None, 0, 0, file_path, is_end_of_file=True))
-                file_queue.task_done()
+                audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True))
+                task_queue.task_done()
                 continue
 
             current_voice = DEFAULT_VOICE
@@ -198,7 +218,7 @@ def generator_worker():
             split_pattern = r'(?<=[\.\?\!])\s+|\n+'
 
             for seg in segments:
-                if not os.path.exists(file_path):
+                if is_file and not os.path.exists(file_path):
                     print(f"Generator: File {file_path} removed. Stopping generation.")
                     break
 
@@ -223,22 +243,24 @@ def generator_worker():
                     try:
                         generator = pipeline(content, voice=current_voice, speed=current_speed, split_pattern=split_pattern)
                         for i, (gs, ps, audio) in enumerate(generator):
-                            if not os.path.exists(file_path):
+                            if is_file and not os.path.exists(file_path):
                                 break
 
                             # Convert Tensor to Numpy if needed
                             if hasattr(audio, 'numpy'):
                                 audio = audio.numpy()
 
-                            audio_queue.put(AudioChunk(audio, 24000, current_volume, file_path))
+                            audio_queue.put(AudioChunk(audio, 24000, current_volume, source_id))
                     except Exception as e:
                         print(f"Generator: Error in pipeline: {e}")
 
-            if os.path.exists(file_path):
-                audio_queue.put(AudioChunk(None, 0, 0, file_path, is_end_of_file=True))
+            if is_file and os.path.exists(file_path):
+                audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True))
+            elif not is_file:
+                audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True))
 
-            file_queue.task_done()
-            print(f"Generator: Finished generating {file_path}")
+            task_queue.task_done()
+            print(f"Generator: Finished generating {source_id}")
 
         except Exception as e:
             print(f"Generator: Critical Error: {e}")
@@ -251,22 +273,26 @@ def player_worker():
         try:
             chunk = audio_queue.get()
 
-            if not os.path.exists(chunk.source_file):
-                print(f"Player: File {chunk.source_file} removed. Discarding chunk.")
-                # If we are skipping a file, we might want to restart the player to clear buffer
-                # But for now, let's just drain the queue.
+            # Check if source file still exists (only for file tasks)
+            is_file = isinstance(chunk.source_id, str) and chunk.source_id.startswith("/")
+
+            if is_file and not os.path.exists(chunk.source_id):
+                print(f"Player: File {chunk.source_id} removed. Discarding chunk.")
                 audio_queue.task_done()
                 continue
 
             if chunk.is_end_of_file:
-                filename = os.path.basename(chunk.source_file)
-                done_path = os.path.join(DONE_DIR, filename)
-                try:
-                    if os.path.exists(chunk.source_file):
-                        shutil.move(chunk.source_file, done_path)
-                        print(f"Player: Finished {filename} (Moved to DONE)")
-                except Exception as e:
-                    print(f"Player: Error moving file: {e}")
+                if is_file:
+                    filename = os.path.basename(chunk.source_id)
+                    done_path = os.path.join(DONE_DIR, filename)
+                    try:
+                        if os.path.exists(chunk.source_id):
+                            shutil.move(chunk.source_id, done_path)
+                            print(f"Player: Finished {filename} (Moved to DONE)")
+                    except Exception as e:
+                        print(f"Player: Error moving file: {e}")
+                else:
+                    print("Player: Finished memory task")
 
                 audio_queue.task_done()
                 continue
@@ -281,8 +307,29 @@ def player_worker():
             print(f"Player: Critical Error: {e}")
             time.sleep(1)
 
+def stdin_reader():
+    print("Stdin Reader: Started")
+    while True:
+        try:
+            line = sys.stdin.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                data = json.loads(line)
+                print(f"Stdin Reader: Received task")
+                task_queue.put(data)
+            except json.JSONDecodeError:
+                print(f"Stdin Reader: Invalid JSON received: {line}")
+        except Exception as e:
+            print(f"Stdin Reader: Error: {e}")
+            time.sleep(1)
+
 def main():
-    print("Starting TTS Kokoro Processor (Expert Stream Mode)...")
+    print("Starting TTS Kokoro Processor (Hybrid Mode)...")
 
     os.makedirs(TODO_DIR, exist_ok=True)
     os.makedirs(WORKING_DIR, exist_ok=True)
@@ -292,19 +339,20 @@ def main():
 
     threading.Thread(target=generator_worker, daemon=True).start()
     threading.Thread(target=player_worker, daemon=True).start()
+    threading.Thread(target=stdin_reader, daemon=True).start()
 
     event_handler = QueueHandler()
     observer = Observer()
     observer.schedule(event_handler, TODO_DIR, recursive=False)
     observer.start()
-    print(f"Monitoring {TODO_DIR}...")
+    print(f"Monitoring {TODO_DIR} and Stdin...")
 
     # Recover files
     for f in sorted(os.listdir(WORKING_DIR), key=lambda x: os.path.getmtime(os.path.join(WORKING_DIR, x))):
         path = os.path.join(WORKING_DIR, f)
         if os.path.isfile(path):
             print(f"Recovering file from WORKING: {f}")
-            file_queue.put(path)
+            task_queue.put(path)
 
     try:
         while True:
@@ -315,7 +363,7 @@ def main():
                 try:
                     print(f"Orchestrator: Moving {todo_file} to WORKING")
                     shutil.move(src, dst)
-                    file_queue.put(dst)
+                    task_queue.put(dst)
                     continue
                 except Exception as e:
                     print(f"Error moving file: {e}")
