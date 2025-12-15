@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
     git \
     mpv \
     curl \
+    socat \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js (LTS)
@@ -37,6 +38,7 @@ COPY package.json .
 RUN npm install
 COPY mcp_server.js .
 COPY --chmod=0755 start.sh .
+COPY --chmod=0755 forward_pipe.sh .
 
 # Create data directories
 RUN mkdir -p /app/data/todo /app/data/working /app/data/done
