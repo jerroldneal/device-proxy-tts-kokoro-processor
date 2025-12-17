@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kokoro TTS Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <style>
+        .tab-active { border-bottom: 2px solid #3b82f6; color: #3b82f6; }
+    </style>
+</head>
+<body class="bg-gray-100 text-gray-800 font-sans">
+    <div id="app" class="max-w-4xl mx-auto p-6">
+        <header class="mb-8 flex justify-between items-center">
+            <h1 class="text-3xl font-bold text-gray-900">Kokoro TTS Dashboard</h1>
+            <div class="flex items-center gap-2">
+                <span class="w-3 h-3 rounded-full" :class="connected ? 'bg-green-500' : 'bg-red-500'"></span>
+                <span class="text-sm text-gray-600">{{ connected ? 'Connected' : 'Disconnected' }}</span>
+            </div>
+        </header>
+
+        <!-- Tabs -->
+        <div class="flex border-b border-gray-300 mb-6">
+            <button @click="activeTab = 'status'" :class="{'tab-active': activeTab === 'status'}" class="px-6 py-3 font-medium hover:text-blue-500">Status</button>
+            <button @click="activeTab = 'history'" :class="{'tab-active': activeTab === 'history'}" class="px-6 py-3 font-medium hover:text-blue-500">History</button>
+            <button @click="activeTab = 'control'" :class="{'tab-active': activeTab === 'control'}" class="px-6 py-3 font-medium hover:text-blue-500">Control</button>
+        </div>
+
+        <!-- Status Tab -->
+        <div v-if="activeTab === 'status'" class="space-y-6">
+            <div class="bg-white p-6 rounded-lg shadow">
+                <h2 class="text-xl font-semibold mb-4">Current State</h2>
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <p class="text-sm text-gray-500">Status</p>
+                        <p class="text-lg font-medium capitalize" :class="status.status === 'processing' ? 'text-green-600' : 'text-gray-700'">{{ status.status }}</p>
+                    </div>
+                    <div>
+                        <p class="text-sm text-gray-500">Default Voice</p>
+                        <p class="text-lg font-medium">{{ status.default_voice }}</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bg-white p-6 rounded-lg shadow" v-if="status.status === 'processing'">
+                <h2 class="text-xl font-semibold mb-4">Currently Speaking</h2>
+                <div class="p-4 bg-gray-50 rounded border border-gray-200">
+                    <p class="text-lg leading-relaxed">{{ status.current_text }}</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- History Tab -->
+        <div v-if="activeTab === 'history'" class="space-y-4">
+            <div v-for="item in history" :key="item.id" class="bg-white p-4 rounded-lg shadow flex justify-between items-center">
+                <div class="flex-1">
+                    <p class="text-gray-800 font-medium truncate">{{ item.text }}</p>
+                    <div class="flex gap-4 text-sm text-gray-500 mt-1">
+                        <span>{{ new Date(item.timestamp).toLocaleTimeString() }}</span>
+                        <span>Voice: {{ item.voice }}</span>
+                        <span>Speed: {{ item.speed }}x</span>
+                    </div>
+                </div>
+                <button @click="replay(item.id)" class="ml-4 px-4 py-2 bg-blue-100 text-blue-600 rounded hover:bg-blue-200 transition">
+                    Replay
+                </button>
+            </div>
+            <div v-if="history.length === 0" class="text-center text-gray-500 py-8">No history available</div>
+        </div>
+
+        <!-- Control Tab -->
+        <div v-if="activeTab === 'control'" class="space-y-6">
+            <div class="bg-white p-6 rounded-lg shadow">
+                <h2 class="text-xl font-semibold mb-4">Voice Settings</h2>
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Default Voice</label>
+                        <select v-model="selectedVoice" class="w-full p-2 border rounded">
+                            <option v-for="voice in voices" :key="voice" :value="voice">{{ voice }}</option>
+                        </select>
+                    </div>
+                    <button @click="setVoice" class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">Set Default Voice</button>
+                </div>
+            </div>
+
+            <div class="bg-white p-6 rounded-lg shadow">
+                <h2 class="text-xl font-semibold mb-4">Emergency Control</h2>
+                <button @click="stop" class="px-6 py-3 bg-red-600 text-white rounded font-bold hover:bg-red-700 w-full">STOP SPEAKING</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const { createApp, ref, onMounted } = Vue;
+
+        createApp({
+            setup() {
+                const activeTab = ref('status');
+                const connected = ref(false);
+                const status = ref({ status: 'idle', current_text: '', default_voice: 'af_heart' });
+                const history = ref([]);
+                const selectedVoice = ref('af_heart');
+                const voices = [
+                    'af_heart', 'af_bella', 'af_nicole', 'af_sarah', 'af_sky',
+                    'am_adam', 'am_michael',
+                    'bf_emma', 'bf_isabella', 'bm_george', 'bm_lewis'
+                ];
+
+                const API_URL = 'http://localhost:3021/api'; // Adjust if needed
+                const WS_URL = 'ws://localhost:3021';
+
+                const connectWS = () => {
+                    const ws = new WebSocket(WS_URL);
+                    ws.onopen = () => connected.value = true;
+                    ws.onclose = () => {
+                        connected.value = false;
+                        setTimeout(connectWS, 2000);
+                    };
+                    ws.onmessage = (event) => {
+                        const msg = JSON.parse(event.data);
+                        if (msg.type === 'status') {
+                            status.value = msg.data;
+                            selectedVoice.value = msg.data.default_voice;
+                        } else if (msg.type === 'history') {
+                            history.value = msg.data;
+                        }
+                    };
+                };
+
+                const replay = async (id) => {
+                    await fetch(`${API_URL}/replay`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ id })
+                    });
+                };
+
+                const setVoice = async () => {
+                    await fetch(`${API_URL}/control`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ command: 'set_voice', voice: selectedVoice.value })
+                    });
+                };
+
+                const stop = async () => {
+                    await fetch(`${API_URL}/control`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ command: 'stop' })
+                    });
+                };
+
+                onMounted(() => {
+                    connectWS();
+                });
+
+                return {
+                    activeTab, connected, status, history, voices, selectedVoice,
+                    replay, setVoice, stop
+                };
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>

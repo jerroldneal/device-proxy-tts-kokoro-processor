@@ -14,8 +14,16 @@ services:
     env_file:
       - .env
     ports:
-      - "3021:3000"
+      - "3021:3001"
+    restart: unless-stopped
+
+  tts-dashboard:
+    build: ./dashboard
+    container_name: tts-dashboard-instance
+    ports:
+      - "3022:80"
     restart: unless-stopped
 
 volumes:
   kokoro_hf_cache:
+

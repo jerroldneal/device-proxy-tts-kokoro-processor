@@ -21,6 +21,15 @@ import queue
 import re
 import sys
 import json
+import uuid
+import logging
+
+# Configure logging
+logging.basicConfig(
+    filename='/app/data/processor.log',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 # Configuration
 DATA_DIR = "/app/data"
@@ -48,6 +57,13 @@ audio_queue = queue.Queue()
 
 # Event to wake up the file watcher
 fs_event = threading.Event()
+
+def emit_status(type, **kwargs):
+    """Emit a JSON status message to stdout."""
+    msg = {"type": type, "timestamp": time.time()}
+    msg.update(kwargs)
+    print(json.dumps(msg), flush=True)
+    logging.info(f"Status Emitted: {json.dumps(msg)}")
 
 class AudioChunk:
     def __init__(self, audio_data, sample_rate, volume, source_id, is_end_of_file=False):
@@ -80,12 +96,12 @@ class PipePlayer:
             # Since we are in a worker thread, blocking is acceptable but we should timeout?
             # Python open() doesn't support timeout.
             # We rely on the proxy being up.
-            print(f"PipePlayer: Opening {self.pipe_path}...")
+            # print(f"PipePlayer: Opening {self.pipe_path}...")
             self.pipe = open(self.pipe_path, 'wb')
-            print("PipePlayer: Connected.")
+            # print("PipePlayer: Connected.")
             return True
         except Exception as e:
-            print(f"PipePlayer: Failed to open pipe: {e}")
+            # print(f"PipePlayer: Failed to open pipe: {e}")
             self.pipe = None
             return False
 
@@ -122,10 +138,10 @@ class PipePlayer:
             self.pipe.write(audio_int16.tobytes())
             self.pipe.flush()
         except BrokenPipeError:
-            print("PipePlayer: Broken pipe. Reconnecting...")
+            # print("PipePlayer: Broken pipe. Reconnecting...")
             self.connect_pipe()
         except Exception as e:
-            print(f"PipePlayer: Write error: {e}")
+            # print(f"PipePlayer: Write error: {e}")
             self.connect_pipe()
 
 class QueueHandler(FileSystemEventHandler):
@@ -139,9 +155,12 @@ class QueueHandler(FileSystemEventHandler):
 
 def initialize_pipeline():
     global pipeline
-    print("Initializing Kokoro Pipeline...")
+    # print("Initializing Kokoro Pipeline...")
+    emit_status("info", message="Initializing Kokoro Pipeline...")
     pipeline = KPipeline(lang_code=LANG_CODE)
-    print("Kokoro Pipeline Initialized.")
+    # print("Kokoro Pipeline Initialized.")
+    emit_status("info", message="Kokoro Pipeline Initialized.")
+    emit_status("status", state="ready")
 
 def parse_segments(text):
     parts = re.split(r'(\{[a-zA-Z]+:[^}]+\})', text)
@@ -175,27 +194,27 @@ def generator_worker():
 
             # Determine if task is file path or memory object
             is_file = isinstance(task, str)
-            source_id = task if is_file else "memory_task"
+            source_id = task if is_file else task.get('id', str(uuid.uuid4()))
             text = ""
 
             if is_file:
                 file_path = task
                 if not os.path.exists(file_path):
-                    print(f"Generator: File {file_path} not found. Skipping.")
+                    # print(f"Generator: File {file_path} not found. Skipping.")
                     task_queue.task_done()
                     continue
 
-                print(f"Generator: Processing file {file_path}")
+                # print(f"Generator: Processing file {file_path}")
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         text = f.read().strip()
                 except Exception as e:
-                    print(f"Generator: Error reading file: {e}")
+                    # print(f"Generator: Error reading file: {e}")
                     task_queue.task_done()
                     continue
             else:
                 # Memory task
-                print("Generator: Processing memory task")
+                # print("Generator: Processing memory task")
                 text = task.get('text', '')
                 # Prepend voice/speed tags if present in task object
                 voice = task.get('voice')
@@ -210,6 +229,9 @@ def generator_worker():
                 task_queue.task_done()
                 continue
 
+            emit_status("status", state="processing", text=text, id=source_id)
+            logging.info(f"Generator: Processing text: {text}")
+
             current_voice = DEFAULT_VOICE
             current_speed = 1.0
             current_volume = 100
@@ -221,7 +243,7 @@ def generator_worker():
 
             for seg in segments:
                 if is_file and not os.path.exists(file_path):
-                    print(f"Generator: File {file_path} removed. Stopping generation.")
+                    # print(f"Generator: File {file_path} removed. Stopping generation.")
                     break
 
                 if seg['type'] == 'command':
@@ -254,7 +276,8 @@ def generator_worker():
 
                             audio_queue.put(AudioChunk(audio, 24000, current_volume, source_id))
                     except Exception as e:
-                        print(f"Generator: Error in pipeline: {e}")
+                        # print(f"Generator: Error in pipeline: {e}")
+                        emit_status("error", message=str(e))
 
             if is_file and os.path.exists(file_path):
                 audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True))
@@ -262,10 +285,12 @@ def generator_worker():
                 audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True))
 
             task_queue.task_done()
-            print(f"Generator: Finished generating {source_id}")
+            # print(f"Generator: Finished generating {source_id}")
+            emit_status("status", state="idle", id=source_id)
 
         except Exception as e:
-            print(f"Generator: Critical Error: {e}")
+            # print(f"Generator: Critical Error: {e}")
+            emit_status("error", message=str(e))
             time.sleep(1)
 
 def player_worker():
@@ -279,7 +304,7 @@ def player_worker():
             is_file = isinstance(chunk.source_id, str) and chunk.source_id.startswith("/")
 
             if is_file and not os.path.exists(chunk.source_id):
-                print(f"Player: File {chunk.source_id} removed. Discarding chunk.")
+                # print(f"Player: File {chunk.source_id} removed. Discarding chunk.")
                 audio_queue.task_done()
                 continue
 
@@ -290,11 +315,13 @@ def player_worker():
                     try:
                         if os.path.exists(chunk.source_id):
                             shutil.move(chunk.source_id, done_path)
-                            print(f"Player: Finished {filename} (Moved to DONE)")
+                            # print(f"Player: Finished {filename} (Moved to DONE)")
                     except Exception as e:
-                        print(f"Player: Error moving file: {e}")
+                        # print(f"Player: Error moving file: {e}")
+                        pass
                 else:
-                    print("Player: Finished memory task")
+                    # print("Player: Finished memory task")
+                    pass
 
                 audio_queue.task_done()
                 continue
@@ -306,15 +333,17 @@ def player_worker():
             audio_queue.task_done()
 
         except Exception as e:
-            print(f"Player: Critical Error: {e}")
+            # print(f"Player: Critical Error: {e}")
             time.sleep(1)
 
 def stdin_reader():
-    print("Stdin Reader: Started")
+    # print("Stdin Reader: Started")
+    emit_status("info", message="Stdin Reader: Started")
     while True:
         try:
             line = sys.stdin.readline()
             if not line:
+                emit_status("info", message="Stdin Reader: EOF received")
                 break
             line = line.strip()
             if not line:
@@ -322,16 +351,21 @@ def stdin_reader():
 
             try:
                 data = json.loads(line)
-                print(f"Stdin Reader: Received task")
+                emit_status("info", message=f"Stdin Reader: Received task {data.get('id')}")
+                # print(f"Stdin Reader: Received task")
                 task_queue.put(data)
             except json.JSONDecodeError:
-                print(f"Stdin Reader: Invalid JSON received: {line}")
+                emit_status("error", message=f"Stdin Reader: Invalid JSON: {line}")
+                # print(f"Stdin Reader: Invalid JSON received: {line}")
+                pass
         except Exception as e:
-            print(f"Stdin Reader: Error: {e}")
+            emit_status("error", message=f"Stdin Reader Error: {e}")
+            # print(f"Stdin Reader: Error: {e}")
             time.sleep(1)
 
 def main():
-    print("Starting TTS Kokoro Processor (Hybrid Mode)...")
+    # print("Starting TTS Kokoro Processor (Hybrid Mode)...")
+    emit_status("info", message="Starting TTS Kokoro Processor (Hybrid Mode)...")
 
     os.makedirs(TODO_DIR, exist_ok=True)
     os.makedirs(WORKING_DIR, exist_ok=True)
@@ -347,13 +381,13 @@ def main():
     observer = Observer()
     observer.schedule(event_handler, TODO_DIR, recursive=False)
     observer.start()
-    print(f"Monitoring {TODO_DIR} and Stdin...")
+    # print(f"Monitoring {TODO_DIR} and Stdin...")
 
     # Recover files
     for f in sorted(os.listdir(WORKING_DIR), key=lambda x: os.path.getmtime(os.path.join(WORKING_DIR, x))):
         path = os.path.join(WORKING_DIR, f)
         if os.path.isfile(path):
-            print(f"Recovering file from WORKING: {f}")
+            # print(f"Recovering file from WORKING: {f}")
             task_queue.put(path)
 
     try:
@@ -363,19 +397,19 @@ def main():
                 src = os.path.join(TODO_DIR, todo_file)
                 dst = os.path.join(WORKING_DIR, todo_file)
                 try:
-                    print(f"Orchestrator: Moving {todo_file} to WORKING")
+                    # print(f"Orchestrator: Moving {todo_file} to WORKING")
                     shutil.move(src, dst)
                     task_queue.put(dst)
                     continue
                 except Exception as e:
-                    print(f"Error moving file: {e}")
+                    # print(f"Error moving file: {e}")
                     time.sleep(1)
 
             fs_event.wait(timeout=1.0)
             fs_event.clear()
 
     except KeyboardInterrupt:
-        print("Stopping...")
+        # print("Stopping...")
         observer.stop()
         observer.join()
 

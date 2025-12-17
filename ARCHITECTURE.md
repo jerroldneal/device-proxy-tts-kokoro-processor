@@ -67,59 +67,70 @@ Currently, the `mcp.json` configuration uses `type: "stdio"`. This means:
 *   **Resource Waste**: A new container is spun up for every session.
 *   **No Persistence**: State is lost between sessions (though TTS is mostly stateless).
 
-## Proposed Improvement: Persistent Server (HTTP/SSE)
+## Persistent Architecture with Dashboard
 
-To reuse the container, we should run it as a long-lived service (daemon) and have the MCP client connect to it via HTTP or SSE.
+The system has been migrated to a persistent architecture using SSE for MCP communication and includes a dedicated Dashboard for monitoring and control.
 
-### Proposed Architecture
+### Diagram
 
 ```mermaid
 graph TD
     subgraph "Host (Windows)"
         VSCode["VS Code / MCP Client"]
+        Browser["Web Browser (Dashboard)"]
         AudioProxy["Audio Driver Proxy (Port 3007)"]
     end
 
-    subgraph "Docker Container (mcp-kokoro-tts) - Persistent"
-        NodeServer["Node.js MCP Server (mcp_server.js)"]
-        PythonProc["Python Processor (processor.py)"]
-        Kokoro["Kokoro TTS Pipeline"]
-        PipeForwarder["Pipe Forwarder"]
+    subgraph "Docker Network"
+        subgraph "tts-kokoro-processor (Port 3021)"
+            NodeServer["Node.js Server (Express + MCP + WS)"]
+            PythonProc["Python Processor (processor.py)"]
+            Kokoro["Kokoro TTS Pipeline"]
+        end
+
+        subgraph "tts-dashboard (Port 3022)"
+            Nginx["Nginx Web Server"]
+            DashboardApp["Vue.js Dashboard App"]
+        end
     end
 
-    VSCode -- "SSE / HTTP (Port 3000)" --> NodeServer
-    NodeServer -- "Spawn" --> PythonProc
-    PythonProc -- "Audio" --> PipeForwarder
-    PipeForwarder -- "TCP" --> AudioProxy
+    VSCode -- "SSE (JSON-RPC)" --> NodeServer
+    Browser -- "HTTP (Port 3022)" --> Nginx
+    DashboardApp -- "REST / WebSocket (Port 3021)" --> NodeServer
+    NodeServer -- "Spawn / Stdio (JSON)" --> PythonProc
+    PythonProc -- "Audio Stream (TCP)" --> AudioProxy
 ```
 
-### Steps to Migrate
+### Components
 
-1.  **Update `mcp_server.js`**:
-    *   Switch from `StdioServerTransport` (or the current hybrid approach) to `StreamableHTTPServerTransport` (SSE) or a simple HTTP server.
-    *   Expose a port (e.g., 3000) in the container.
+1.  **Node.js Server (`mcp_server.js`)**:
+    *   **MCP Endpoint**: `/sse` for VS Code communication.
+    *   **REST API**: `/api/status`, `/api/history`, `/api/control` for the Dashboard.
+    *   **WebSocket**: Real-time status updates to the Dashboard.
+    *   **State Management**: Maintains history and current status in memory.
 
-2.  **Update Docker Command**:
-    *   Run the container in detached mode (`-d`) or via Docker Compose, mapping the port (e.g., `-p 3021:3000`).
-    *   Do *not* let VS Code manage the container lifecycle via `mcp.json` `command`.
+2.  **Python Processor (`processor.py`)**:
+    *   **Input**: Receives JSON commands via `stdin`.
+    *   **Output**: Emits JSON status events (start, finish, error) via `stdout`.
+    *   **Audio**: Streams raw audio to the Audio Proxy via a named pipe and `socat`.
 
-3.  **Update `mcp.json`**:
-    *   Change `type` to `sse` (or `http` if using a proxy).
-    *   Set `url` to `http://localhost:3021/sse`.
+3.  **Dashboard (`tts-dashboard`)**:
+    *   **Tech Stack**: Nginx serving a static Vue.js (CDN) application.
+    *   **Features**:
+        *   **Status**: View connection state, current voice, and processing status.
+        *   **History**: List of recently spoken items with Replay functionality.
+        *   **Control**: Change default voice, Stop playback.
+        *   **Live View**: See the text currently being spoken.
 
-### Example `mcp.json` (SSE)
+### API Endpoints
 
-```json
-{
-  "mcpServers": {
-    "kokoro-tts": {
-      "type": "sse",
-      "url": "http://localhost:3021/sse"
-    }
-  }
-}
-```
+*   `GET /api/status`: Returns current state (idle/processing), current text, and voice settings.
+*   `GET /api/history`: Returns a list of past spoken items.
+*   `POST /api/control`: Send commands like `stop` or `set_voice`.
+*   `POST /api/replay`: Re-queue a specific history item.
 
-### Benefits
-*   **Instant Response**: The model is already loaded in the running container.
-*   **Efficiency**: Only one container running regardless of how many VS Code windows are open.
+### WebSocket Events
+
+*   `status`: Broadcasts the full state object whenever it changes.
+*   `history`: Broadcasts the updated history list when a new item is added.
+
