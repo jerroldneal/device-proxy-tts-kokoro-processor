@@ -110,10 +110,12 @@ server.tool(
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// app.use(express.json()); // Removed global JSON parsing to avoid conflict with MCP SDK
+
+const jsonParser = express.json();
 
 // REST API
-app.post("/api/speak", (req, res) => {
+app.post("/api/speak", jsonParser, (req, res) => {
   const { text, voice, speed } = req.body;
   if (!text) return res.status(400).json({ error: "Text is required" });
 
@@ -142,7 +144,7 @@ app.post("/api/speak", (req, res) => {
 app.get("/api/status", (req, res) => res.json(state));
 app.get("/api/history", (req, res) => res.json(state.history));
 
-app.post("/api/control", (req, res) => {
+app.post("/api/control", jsonParser, (req, res) => {
   const { command, voice } = req.body;
   if (command === "set_voice") {
     state.default_voice = voice;
@@ -152,7 +154,7 @@ app.post("/api/control", (req, res) => {
   res.json({ success: true });
 });
 
-app.post("/api/replay", (req, res) => {
+app.post("/api/replay", jsonParser, (req, res) => {
   const { id } = req.body;
   const item = state.history.find(i => i.id === id);
   if (item) {

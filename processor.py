@@ -136,13 +136,20 @@ class PipePlayer:
 
         try:
             self.pipe.write(audio_int16.tobytes())
-            self.pipe.flush()
+            # self.pipe.flush() # Let OS buffer for smoother streaming
         except BrokenPipeError:
             # print("PipePlayer: Broken pipe. Reconnecting...")
             self.connect_pipe()
         except Exception as e:
             # print(f"PipePlayer: Write error: {e}")
             self.connect_pipe()
+
+    def flush(self):
+        if self.pipe:
+            try:
+                self.pipe.flush()
+            except:
+                pass
 
 class QueueHandler(FileSystemEventHandler):
     def on_created(self, event):
@@ -309,6 +316,7 @@ def player_worker():
                 continue
 
             if chunk.is_end_of_file:
+                player.flush()
                 if is_file:
                     filename = os.path.basename(chunk.source_id)
                     done_path = os.path.join(DONE_DIR, filename)
