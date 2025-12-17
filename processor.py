@@ -215,7 +215,9 @@ def generator_worker():
             current_volume = 100
 
             segments = parse_segments(text)
-            split_pattern = r'(?<=[\.\?\!])\s+|\n+'
+            # split_pattern = r'(?<=[\.\?\!])\s+|\n+'
+            # Only split on newlines to avoid pauses between sentences
+            split_pattern = r'\n+'
 
             for seg in segments:
                 if is_file and not os.path.exists(file_path):
