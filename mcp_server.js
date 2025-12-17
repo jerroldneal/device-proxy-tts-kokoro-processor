@@ -1,9 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 import { spawn } from "child_process";
 import path from "path";
 import { fileURLToPath } from "url";
+import express from "express";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const processorPath = path.join(__dirname, "processor.py");
@@ -14,7 +15,7 @@ const python = spawn("python", ["-u", processorPath], { cwd: __dirname });
 
 // Handle Python output
 python.stdout.on("data", (data) => {
-  console.error(`[Python]: ${data}`);
+  console.log(`[Python]: ${data}`);
 });
 
 python.stderr.on("data", (data) => {
@@ -52,10 +53,24 @@ server.tool(
   }
 );
 
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("Kokoro TTS Processor MCP Server running on stdio");
-}
+const app = express();
+let transport;
 
-main();
+app.get("/sse", async (req, res) => {
+  console.log("New SSE connection established");
+  transport = new SSEServerTransport("/messages", res);
+  await server.connect(transport);
+});
+
+app.post("/messages", async (req, res) => {
+  if (transport) {
+    await transport.handlePostMessage(req, res);
+  } else {
+    res.status(400).send("No active transport");
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Kokoro TTS Processor MCP Server running on SSE at http://localhost:${PORT}/sse`);
+});
