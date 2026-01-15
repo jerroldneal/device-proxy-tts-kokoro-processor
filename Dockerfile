@@ -37,6 +37,7 @@ COPY package.json .
 RUN npm install
 COPY mcp_server.js .
 COPY --chmod=0755 start.sh .
+RUN sed -i 's/\r$//' start.sh
 
 # Create data directories
 RUN mkdir -p /app/data/todo /app/data/working /app/data/done
