@@ -4,6 +4,8 @@ services:
   tts-kokoro-processor:
     build: .
     container_name: tts-kokoro-processor-instance
+    ports:
+      - "3021:3001"
     volumes:
       - c:/.tts:/app/data
       - kokoro_hf_cache:/root/.cache/huggingface
