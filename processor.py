@@ -50,12 +50,13 @@ audio_queue = queue.Queue()
 fs_event = threading.Event()
 
 class AudioChunk:
-    def __init__(self, audio_data, sample_rate, volume, source_id, is_end_of_file=False):
+    def __init__(self, audio_data, sample_rate, volume, source_id, is_end_of_file=False, mp3_info=None):
         self.audio_data = audio_data
         self.sample_rate = sample_rate
         self.volume = volume
         self.source_id = source_id
         self.is_end_of_file = is_end_of_file
+        self.mp3_info = mp3_info  # Dict with mp3_path and accumulated audio
 
 class PipePlayer:
     def __init__(self, pipe_path="/tmp/audio_pipe", sample_rate=24000, target_rate=48000):
@@ -177,6 +178,9 @@ def generator_worker():
             is_file = isinstance(task, str)
             source_id = task if is_file else "memory_task"
             text = ""
+            mp3_mode = False
+            mp3_path = None
+            accumulated_audio = []
 
             if is_file:
                 file_path = task
@@ -197,11 +201,14 @@ def generator_worker():
                 # Memory task
                 print("Generator: Processing memory task")
                 text = task.get('text', '')
+                mp3_mode = task.get('mp3', False)
+                mp3_path = task.get('mp3_path')
                 # Prepend voice/speed tags if present in task object
                 voice = task.get('voice')
                 speed = task.get('speed')
                 prefix = ""
-                if voice: prefix += f"{{voice:{voice}}} "
+                mp3_info = {'path': mp3_path, 'audio': accumulated_audio} if mp3_mode else None
+                audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True, mp3_info=mp3_info
                 if speed: prefix += f"{{speed:{speed}}} "
                 text = prefix + text
 
@@ -249,9 +256,16 @@ def generator_worker():
                             # Convert Tensor to Numpy if needed
                             if hasattr(audio, 'numpy'):
                                 audio = audio.numpy()
-
-                            audio_queue.put(AudioChunk(audio, 24000, current_volume, source_id))
-                    except Exception as e:
+if mp3_mode:
+                                # Accumulate audio for MP3 file
+                                accumulated_audio.append(audio)
+                            else:
+                                # Send to player for immediate playback
+                mp3_info = {'path': mp3_path, 'audio': accumulated_audio} if mp3_mode else None
+                audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True, mp3_info=mp3_info))
+            elif not is_file:
+                mp3_info = {'path': mp3_path, 'audio': accumulated_audio} if mp3_mode else None
+                audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True, mp3_info=mp3_info
                         print(f"Generator: Error in pipeline: {e}")
 
             if is_file and os.path.exists(file_path):
@@ -282,6 +296,38 @@ def player_worker():
                 continue
 
             if chunk.is_end_of_file:
+                # Handle MP3 file creation
+                if chunk.mp3_info and chunk.mp3_info.get('path') and chunk.mp3_info.get('audio'):
+                    mp3_path = chunk.mp3_info['path']
+                    audio_list = chunk.mp3_info['audio']
+
+                    try:
+                        # Concatenate all audio chunks
+                        full_audio = np.concatenate(audio_list)
+
+                        # Save as WAV first, then convert to MP3
+                        wav_path = mp3_path.replace('.mp3', '.wav') if mp3_path.endswith('.mp3') else mp3_path + '.wav'
+                        sf.write(wav_path, full_audio, 24000)
+
+                        # Convert WAV to MP3 using ffmpeg
+                        try:
+                            subprocess.run(['ffmpeg', '-y', '-i', wav_path, '-codec:a', 'libmp3lame', '-qscale:a', '2', mp3_path],
+                                         check=True, capture_output=True)
+                            os.remove(wav_path)  # Clean up WAV file
+                            print(f"Player: MP3 file created at {mp3_path}")
+
+                            # Announce file creation to speaker
+                            announcement = f"MP3 file created at {os.path.basename(mp3_path)}"
+                            announcement_task = {'text': announcement, 'voice': DEFAULT_VOICE, 'speed': 1.0, 'mp3': False}
+                            task_queue.put(announcement_task)
+
+                        except subprocess.CalledProcessError as e:
+                            print(f"Player: Error converting to MP3: {e.stderr.decode()}")
+                            # Fall back to WAV if MP3 conversion fails
+                            print(f"Player: WAV file saved at {wav_path}")
+                    except Exception as e:
+                        print(f"Player: Error creating MP3 file: {e}")
+
                 if is_file:
                     filename = os.path.basename(chunk.source_id)
                     done_path = os.path.join(DONE_DIR, filename)

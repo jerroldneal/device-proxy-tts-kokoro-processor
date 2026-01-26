@@ -87,12 +87,14 @@ server.tool(
     text: z.string().describe("The text to convert to speech"),
     voice: z.string().optional().describe("The voice to use (default: af_heart). Options: af_heart, af_bella, af_nicole, af_sarah, af_sky, am_adam, am_michael, bf_emma, bf_isabella, bm_george, bm_lewis"),
     speed: z.number().optional().describe("Speed of speech (default: 1.0)"),
+    mp3: z.boolean().optional().describe("If true, output to MP3 file instead of speaker (default: false)"),
+    mp3_path: z.string().optional().describe("Path for the MP3 file (required if mp3 is true)"),
   },
-  async ({ text, voice, speed }) => {
+  async ({ text, voice, speed, mp3, mp3_path }) => {
     const selectedVoice = voice || state.default_voice;
     const selectedSpeed = speed || 1.0;
     const id = uuidv4();
-    const payload = { id, text, voice: selectedVoice, speed: selectedSpeed };
+    const payload = { id, text, voice: selectedVoice, speed: selectedSpeed, mp3: mp3 || false, mp3_path: mp3_path || null };
 
     addToHistory({ ...payload, timestamp: new Date().toISOString() });
 
@@ -116,11 +118,11 @@ const jsonParser = express.json();
 
 // REST API
 app.post("/api/speak", jsonParser, (req, res) => {
-  const { text, voice, speed } = req.body;
+  const { text, voice, speed, mp3, mp3_path } = req.body;
   if (!text) return res.status(400).json({ error: "Text is required" });
 
   const id = uuidv4();
-  const payload = { id, text, voice: voice || state.default_voice, speed: speed || 1.0 };
+  const payload = { id, text, voice: voice || state.default_voice, speed: speed || 1.0, mp3: mp3 || false, mp3_path: mp3_path || null };
 
   console.error(`[API] Received speak request: ${text.substring(0, 50)}...`);
   addToHistory({ ...payload, timestamp: new Date().toISOString() });
