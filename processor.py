@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import soundfile as sf
 import numpy as np
+import torch
 from kokoro import KPipeline
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -138,10 +139,56 @@ class QueueHandler(FileSystemEventHandler):
         if not event.is_directory:
             fs_event.set()
 
+def get_device():
+    """Detect and return the best available device for inference."""
+    use_gpu = os.getenv('USE_GPU', 'true').lower() == 'true'
+
+    if not use_gpu:
+        print("GPU disabled via USE_GPU=false")
+        return 'cpu'
+
+    if torch.cuda.is_available():
+        device = 'cuda'
+        print(f"CUDA available: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA version: {torch.version.cuda}")
+        return device
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        print("MPS (Apple Silicon) available")
+        return 'mps'
+    else:
+        print("No GPU available, falling back to CPU")
+        return 'cpu'
+
 def initialize_pipeline():
     global pipeline
     print("Initializing Kokoro Pipeline...")
+
+    device = get_device()
+    print(f"Using device: {device}")
+
+    # Initialize pipeline
     pipeline = KPipeline(lang_code=LANG_CODE)
+
+    # Move model to GPU if available
+    if device == 'cuda':
+        try:
+            pipeline.model = pipeline.model.cuda()
+            print("Model successfully moved to CUDA")
+            # Print GPU memory info
+            if torch.cuda.is_available():
+                print(f"GPU Memory Allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
+                print(f"GPU Memory Reserved: {torch.cuda.memory_reserved(0) / 1024**2:.2f} MB")
+        except Exception as e:
+            print(f"Warning: Failed to move model to CUDA: {e}")
+            print("Falling back to CPU")
+    elif device == 'mps':
+        try:
+            pipeline.model = pipeline.model.to(torch.device('mps'))
+            print("Model successfully moved to MPS")
+        except Exception as e:
+            print(f"Warning: Failed to move model to MPS: {e}")
+            print("Falling back to CPU")
+
     print("Kokoro Pipeline Initialized.")
 
 def parse_segments(text):
@@ -276,6 +323,10 @@ def generator_worker():
 
             task_queue.task_done()
             print(f"Generator: Finished generating {source_id}")
+
+            # Clean up GPU memory if using CUDA
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         except Exception as e:
             print(f"Generator: Critical Error: {e}")
