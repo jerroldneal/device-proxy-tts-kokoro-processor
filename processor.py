@@ -207,13 +207,13 @@ def generator_worker():
                 voice = task.get('voice')
                 speed = task.get('speed')
                 prefix = ""
-                mp3_info = {'path': mp3_path, 'audio': accumulated_audio} if mp3_mode else None
-                audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True, mp3_info=mp3_info
-                if speed: prefix += f"{{speed:{speed}}} "
+                if voice: prefix += "{{voice:{}}} ".format(voice)
+                if speed: prefix += "{{speed:{}}} ".format(speed)
                 text = prefix + text
 
             if not text:
-                audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True))
+                mp3_info = {'path': mp3_path, 'audio': accumulated_audio} if mp3_mode else None
+                audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True, mp3_info=mp3_info))
                 task_queue.task_done()
                 continue
 
@@ -256,22 +256,22 @@ def generator_worker():
                             # Convert Tensor to Numpy if needed
                             if hasattr(audio, 'numpy'):
                                 audio = audio.numpy()
-if mp3_mode:
+
+                            if mp3_mode:
                                 # Accumulate audio for MP3 file
                                 accumulated_audio.append(audio)
                             else:
                                 # Send to player for immediate playback
+                                audio_queue.put(AudioChunk(audio, 24000, current_volume, source_id))
+                    except Exception as e:
+                        print(f"Generator: Error in pipeline: {e}")
+
+            if is_file and os.path.exists(file_path):
                 mp3_info = {'path': mp3_path, 'audio': accumulated_audio} if mp3_mode else None
                 audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True, mp3_info=mp3_info))
             elif not is_file:
                 mp3_info = {'path': mp3_path, 'audio': accumulated_audio} if mp3_mode else None
-                audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True, mp3_info=mp3_info
-                        print(f"Generator: Error in pipeline: {e}")
-
-            if is_file and os.path.exists(file_path):
-                audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True))
-            elif not is_file:
-                audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True))
+                audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True, mp3_info=mp3_info))
 
             task_queue.task_done()
             print(f"Generator: Finished generating {source_id}")
