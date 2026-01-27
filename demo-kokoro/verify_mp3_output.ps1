@@ -1,15 +1,26 @@
 $ErrorActionPreference = "Stop"
 
-$mp3OutputPath = "C:\temp\kokoro_test_output.mp3"
+# Use the mounted volume path (C:\.tts maps to /app/data in container)
+$hostMp3Path = "C:\.tts\mp3\kokoro_test_output.mp3"
+$containerMp3Path = "/app/data/mp3/kokoro_test_output.mp3"
 $apiUrl = "http://localhost:3021/api/speak"
+
+# Ensure the mp3 directory exists
+$mp3Dir = "C:\.tts\mp3"
+if (-not (Test-Path $mp3Dir)) {
+    New-Item -ItemType Directory -Force -Path $mp3Dir | Out-Null
+}
 
 Write-Host "=== Kokoro TTS MP3 Output Verification ===" -ForegroundColor Cyan
 Write-Host ""
+Write-Host "Host path: $hostMp3Path" -ForegroundColor Gray
+Write-Host "Container path: $containerMp3Path" -ForegroundColor Gray
+Write-Host ""
 
 # Clean up any existing output file
-if (Test-Path $mp3OutputPath) {
+if (Test-Path $hostMp3Path) {
     Write-Host "Removing existing MP3 file..." -ForegroundColor Yellow
-    Remove-Item $mp3OutputPath -Force
+    Remove-Item $hostMp3Path -Force
 }
 
 # Prepare the test text
@@ -26,13 +37,13 @@ Write-Host "Test text prepared:" -ForegroundColor Green
 Write-Host $testText
 Write-Host ""
 
-# Create the request body
+# Create the request body (use container path for mp3_path)
 $requestBody = @{
     text = $testText
     voice = "af_heart"
     speed = 1.0
     mp3 = $true
-    mp3_path = $mp3OutputPath
+    mp3_path = $containerMp3Path
 } | ConvertTo-Json
 
 Write-Host "Sending MP3 generation request to $apiUrl..." -ForegroundColor Cyan
@@ -50,17 +61,18 @@ try {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
     while ($sw.Elapsed.TotalSeconds -lt $timeout) {
-        if (Test-Path $mp3OutputPath) {
-            $fileInfo = Get-Item $mp3OutputPath
+        if (Test-Path $hostMp3Path) {
+            $fileInfo = Get-Item $hostMp3Path
             if ($fileInfo.Length -gt 0) {
                 Write-Host "SUCCESS: MP3 file created!" -ForegroundColor Green
-                Write-Host "  Location: $mp3OutputPath" -ForegroundColor Cyan
+                Write-Host "  Host Location: $hostMp3Path" -ForegroundColor Cyan
+                Write-Host "  Container Location: $containerMp3Path" -ForegroundColor Gray
                 Write-Host "  Size: $($fileInfo.Length) bytes" -ForegroundColor Cyan
                 Write-Host "  Created: $($fileInfo.CreationTime)" -ForegroundColor Cyan
                 Write-Host ""
 
                 # Verify it's a valid MP3 by checking the header
-                $bytes = [System.IO.File]::ReadAllBytes($mp3OutputPath)
+                $bytes = [System.IO.File]::ReadAllBytes($hostMp3Path)
                 if ($bytes.Length -gt 2 -and $bytes[0] -eq 0xFF -and ($bytes[1] -band 0xE0) -eq 0xE0) {
                     Write-Host "MP3 header validation: PASSED (Valid MP3 file)" -ForegroundColor Green
                 } elseif ($bytes.Length -gt 4 -and $bytes[0] -eq 0x49 -and $bytes[1] -eq 0x44 -and $bytes[2] -eq 0x33) {
@@ -71,10 +83,10 @@ try {
 
                 Write-Host ""
                 Write-Host "You can play the file with:" -ForegroundColor Cyan
-                Write-Host "  Start-Process '$mp3OutputPath'" -ForegroundColor White
+                Write-Host "  Start-Process '$hostMp3Path'" -ForegroundColor White
                 Write-Host ""
                 Write-Host "Or via the play-mp3 endpoint:" -ForegroundColor Cyan
-                Write-Host "  curl 'http://localhost:3006/play-mp3?filePath=$([System.Uri]::EscapeDataString($mp3OutputPath))'" -ForegroundColor White
+                Write-Host "  curl 'http://localhost:3006/play-mp3?filePath=$([System.Uri]::EscapeDataString($hostMp3Path))'" -ForegroundColor White
 
                 exit 0
             }

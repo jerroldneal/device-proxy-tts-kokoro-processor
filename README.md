@@ -90,11 +90,12 @@ graph TB
 
 ## Configuration
 
-- **Volume**: Mounts host `C:/.tts` to `/app/data`.
+- **Volume**: Mounts host `C:/.tts` to `/app/data` and `C:/temp` to `/app/temp`.
 - **Cache**: Uses a Docker volume `kokoro_hf_cache` to store the downloaded model weights (~300MB).
 - **Voice**: Configurable via `KOKORO_VOICE` in `.env` file. Defaults to `af_heart`.
 - **Port**: Exposes MCP/REST API on port `3021` (maps to container port `3001`).
 - **Base Image**: Built on `audio-driver-proxy:latest` for audio pipeline access.
+- **MP3 Output**: MP3 files should be written to `/app/data/mp3/` (host: `C:/.tts/mp3/`) or `/app/temp/` (host: `C:/temp/`).
 
 ## MCP Tool Interface
 
@@ -106,11 +107,15 @@ The service exposes a `speak` tool via MCP:
   "voice": "af_heart",  // Optional
   "speed": 1.0,         // Optional
   "mp3": false,         // Optional: output to MP3 file
-  "mp3_path": "/path/to/output.mp3"  // Required if mp3=true
+  "mp3_path": "/app/temp/output.mp3"  // Container path (use /app/data/ or /app/temp/)
 }
 ```
 
 **MP3 Mode**: When `mp3: true`, the entire audio is written to a file (no chunking), and the file creation is announced to the speaker.
+
+**MP3 Path Examples**:
+- Container: `/app/temp/my_audio.mp3` → Host: `C:/temp/my_audio.mp3`
+- Container: `/app/data/mp3/my_audio.mp3` → Host: `C:/.tts/mp3/my_audio.mp3`
 
 ## Dynamic Voice & Parameter Control
 

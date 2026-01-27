@@ -8,6 +8,7 @@ services:
       - "3021:3001"
     volumes:
       - c:/.tts:/app/data
+      - c:/temp:/app/temp
       - kokoro_hf_cache:/root/.cache/huggingface
       - ./processor.py:/app/processor.py
       # Hot-swap the audio proxy with the Python version
