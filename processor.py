@@ -203,6 +203,7 @@ def generator_worker():
                 text = task.get('text', '')
                 mp3_mode = task.get('mp3', False)
                 mp3_path = task.get('mp3_path')
+                print(f"Generator: mp3_mode={mp3_mode}, mp3_path={mp3_path}")
                 # Prepend voice/speed tags if present in task object
                 voice = task.get('voice')
                 speed = task.get('speed')

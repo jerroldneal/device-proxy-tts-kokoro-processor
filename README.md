@@ -41,7 +41,7 @@ graph TB
     end
 
     subgraph "Audio Pipeline"
-        P[/tmp/audio_pipe<br/>Named Pipe]
+        P[tmp/audio_pipe</BR>Named Pipe]
         Q[Audio Driver Proxy]
         R[Host Audio Device]
     end
