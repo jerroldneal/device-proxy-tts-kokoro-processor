@@ -4,8 +4,14 @@ services:
   tts-kokoro-processor:
     build: .
     container_name: tts-kokoro-processor-instance
-    # NOTE: GPU support enabled - Using PyTorch 1.13.1 for TITAN Xp (sm_61) support
-    runtime: nvidia
+    # NOTE: GPU enabled using 'deploy' syntax (works with Docker Compose v2 + WSL2)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - USE_GPU=true
