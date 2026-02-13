@@ -22,6 +22,7 @@ import queue
 import re
 import sys
 import json
+import socket
 
 # Configuration
 DATA_DIR = "/app/data"
@@ -59,56 +60,43 @@ class AudioChunk:
         self.is_end_of_file = is_end_of_file
         self.mp3_info = mp3_info  # Dict with mp3_path and accumulated audio
 
-class PipePlayer:
-    def __init__(self, pipe_path="/tmp/audio_pipe", sample_rate=24000, target_rate=48000):
-        self.pipe_path = pipe_path
+class TCPPlayer:
+    def __init__(self, host="host.docker.internal", port=3007, sample_rate=24000, target_rate=48000):
+        self.host = host
+        self.port = port
         self.sample_rate = sample_rate
         self.target_rate = target_rate
-        self.pipe = None
-        # Don't block init, connect on first write
+        self.socket = None
 
-    def connect_pipe(self):
-        if self.pipe:
-            try: self.pipe.close()
-            except: pass
-            self.pipe = None
-
-        if not os.path.exists(self.pipe_path):
-            # Wait for proxy to create it
-            return False
+    def connect_socket(self):
+        if self.socket:
+            try:
+                self.socket.close()
+            except:
+                pass
+            self.socket = None
 
         try:
-            # Open for writing. This blocks until a reader is connected.
-            # Since we are in a worker thread, blocking is acceptable but we should timeout?
-            # Python open() doesn't support timeout.
-            # We rely on the proxy being up.
-            print(f"PipePlayer: Opening {self.pipe_path}...")
-            self.pipe = open(self.pipe_path, 'wb')
-            print("PipePlayer: Connected.")
+            print(f"TCPPlayer: Connecting to {self.host}:{self.port}...")
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.connect((self.host, self.port))
+            print("TCPPlayer: Connected.")
             return True
         except Exception as e:
-            print(f"PipePlayer: Failed to open pipe: {e}")
-            self.pipe = None
+            print(f"TCPPlayer: Failed to connect: {e}")
+            self.socket = None
             return False
 
     def play_chunk(self, audio_data, volume=100):
-        if self.pipe is None:
-            if not self.connect_pipe():
-                # If we can't connect, we drop the chunk to avoid hanging forever?
-                # Or we retry?
+        if self.socket is None:
+            if not self.connect_socket():
                 time.sleep(0.1)
                 return
 
         # Resample 24k -> 48k
         if self.target_rate == 48000 and self.sample_rate == 24000:
-            # Linear interpolation
             x = np.arange(len(audio_data))
             x_new = np.arange(0, len(audio_data), 0.5)
-            # Note: x_new might be slightly larger/smaller depending on float precision,
-            # but np.interp handles it.
-            # Actually, x_new length should be exactly 2x.
-            # Let's use linspace for exactness?
-            # No, arange is fine.
             audio_data = np.interp(x_new, x, audio_data)
 
         # Apply volume
@@ -121,14 +109,13 @@ class PipePlayer:
         audio_int16 = (audio_data * 32767).astype(np.int16)
 
         try:
-            self.pipe.write(audio_int16.tobytes())
-            self.pipe.flush()
-        except BrokenPipeError:
-            print("PipePlayer: Broken pipe. Reconnecting...")
-            self.connect_pipe()
+            self.socket.sendall(audio_int16.tobytes())
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            print(f"TCPPlayer: Connection lost ({e}). Reconnecting...")
+            self.connect_socket()
         except Exception as e:
-            print(f"PipePlayer: Write error: {e}")
-            self.connect_pipe()
+            print(f"TCPPlayer: Send error: {e}")
+            self.connect_socket()
 
 class QueueHandler(FileSystemEventHandler):
     def on_created(self, event):
@@ -333,7 +320,7 @@ def generator_worker():
             time.sleep(1)
 
 def player_worker():
-    player = PipePlayer()
+    player = TCPPlayer()
 
     while True:
         try:

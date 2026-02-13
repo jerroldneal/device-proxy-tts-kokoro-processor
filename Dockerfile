@@ -1,4 +1,4 @@
-FROM audio-driver-proxy:latest
+FROM python:3.10-slim
 
 # Keep Python from buffering stdout and stderr
 ENV PYTHONUNBUFFERED=1
