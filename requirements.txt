@@ -1,5 +1,5 @@
 kokoro>=0.9.4
 soundfile
-torch
-numpy
+torch==2.0.1
+numpy<2.0
 watchdog

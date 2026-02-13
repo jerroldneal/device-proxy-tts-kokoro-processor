@@ -4,11 +4,11 @@ services:
   tts-kokoro-processor:
     build: .
     container_name: tts-kokoro-processor-instance
-    # NOTE: GPU support disabled - TITAN Xp (sm_61) not supported by PyTorch 2.10
-    # runtime: nvidia
+    # NOTE: GPU support enabled - Using PyTorch 1.13.1 for TITAN Xp (sm_61) support
+    runtime: nvidia
     environment:
-      # - NVIDIA_VISIBLE_DEVICES=all
-      - USE_GPU=false
+      - NVIDIA_VISIBLE_DEVICES=all
+      - USE_GPU=true
     ports:
       - "3021:3001"
     volumes:
