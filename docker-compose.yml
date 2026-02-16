@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   tts-kokoro-processor:
     build: .
@@ -18,10 +16,13 @@ services:
     ports:
       - "3021:3001"
     volumes:
-      - c:/.tts:/app/data
-      - c:/temp:/app/temp
+      - ~/.tts:/app/data
+      - ~/temp:/app/temp
       - kokoro_hf_cache:/root/.cache/huggingface
       - ./processor.py:/app/processor.py
+      # Hot-swap the audio proxy with the Python version (disabled - files don't exist)
+      # - ../pipes/audio-driver-proxy/forward_pipe.py:/app/forward_pipe.py
+      # - ../pipes/audio-driver-proxy/forward_pipe_shim.sh:/app/forward_pipe.sh
     env_file:
       - .env
     restart: unless-stopped
