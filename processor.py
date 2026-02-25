@@ -29,6 +29,7 @@ DATA_DIR = "/app/data"
 TODO_DIR = os.path.join(DATA_DIR, "todo")
 WORKING_DIR = os.path.join(DATA_DIR, "working")
 DONE_DIR = os.path.join(DATA_DIR, "done")
+MP3_DIR = os.path.join(DATA_DIR, "mp3")
 POLL_INTERVAL = 0.1
 DEFAULT_VOICE = os.getenv('KOKORO_VOICE', 'af_heart')
 LANG_CODE = 'a'
@@ -239,6 +240,11 @@ def generator_worker():
                 mp3_mode = task.get('mp3', False)
                 mp3_path = task.get('mp3_path')
                 mp3_announce = task.get('mp3announce', False)
+                # Auto-generate mp3_path if mp3 mode but no path provided
+                if mp3_mode and not mp3_path:
+                    import datetime
+                    ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                    mp3_path = os.path.join(MP3_DIR, f'tts-{ts}.mp3')
                 print(f"Generator: mp3_mode={mp3_mode}, mp3_path={mp3_path}, mp3_announce={mp3_announce}")
                 # Prepend voice/speed tags if present in task object
                 voice = task.get('voice')
@@ -343,6 +349,9 @@ def player_worker():
                     audio_list = chunk.mp3_info['audio']
 
                     try:
+                        # Ensure output directory exists
+                        os.makedirs(os.path.dirname(mp3_path), exist_ok=True)
+
                         # Concatenate all audio chunks
                         full_audio = np.concatenate(audio_list)
 
@@ -422,6 +431,7 @@ def main():
     os.makedirs(TODO_DIR, exist_ok=True)
     os.makedirs(WORKING_DIR, exist_ok=True)
     os.makedirs(DONE_DIR, exist_ok=True)
+    os.makedirs(MP3_DIR, exist_ok=True)
 
     initialize_pipeline()
 

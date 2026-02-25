@@ -10,12 +10,14 @@ WORKDIR /app
 # libsndfile1: required for soundfile (Kokoro)
 # git: required for some pip installs
 # mpv: Audio player
+# ffmpeg: required for WAV to MP3 conversion
 RUN apt-get update && apt-get install -y \
     espeak-ng \
     libsndfile1 \
     git \
     mpv \
     curl \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js (LTS)

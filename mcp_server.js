@@ -1,5 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { spawn } from "child_process";
 import path from "path";
@@ -9,6 +9,8 @@ import { WebSocketServer } from "ws";
 import http from "http";
 import cors from "cors";
 import { v4 as uuidv4 } from "uuid";
+import fs from "fs";
+import { startReverseClient } from "./kokoro-reverse-client.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const processorPath = path.join(__dirname, "processor.py");
@@ -76,40 +78,49 @@ function addToHistory(item) {
   broadcast({ type: "history", data: state.history });
 }
 
-const server = new McpServer({
-  name: "tts-kokoro-processor-mcp",
-  version: "1.0.0",
-});
+// Tool handler extracted for reuse across server instances
+const speakToolParams = {
+  text: z.string().describe("The text to convert to speech"),
+  voice: z.string().optional().describe("The voice to use (default: af_heart). Options: af_heart, af_bella, af_nicole, af_sarah, af_sky, am_adam, am_michael, bf_emma, bf_isabella, bm_george, bm_lewis"),
+  speed: z.number().optional().describe("Speed of speech (default: 1.0)"),
+  mp3: z.boolean().optional().describe("If true, output to MP3 file instead of speaker (default: false)"),
+  mp3_path: z.string().optional().describe("Path for the MP3 file (required if mp3 is true)"),
+  mp3announce: z.boolean().optional().describe("If true, announce MP3 file creation via speaker (default: false)"),
+};
 
-server.tool(
-  "speak",
-  {
-    text: z.string().describe("The text to convert to speech"),
-    voice: z.string().optional().describe("The voice to use (default: af_heart). Options: af_heart, af_bella, af_nicole, af_sarah, af_sky, am_adam, am_michael, bf_emma, bf_isabella, bm_george, bm_lewis"),
-    speed: z.number().optional().describe("Speed of speech (default: 1.0)"),
-    mp3: z.boolean().optional().describe("If true, output to MP3 file instead of speaker (default: false)"),
-    mp3_path: z.string().optional().describe("Path for the MP3 file (required if mp3 is true)"),
-    mp3announce: z.boolean().optional().describe("If true, announce MP3 file creation via speaker (default: false)"),
-  },
-  async ({ text, voice, speed, mp3, mp3_path, mp3announce }) => {
-    const selectedVoice = voice || state.default_voice;
-    const selectedSpeed = speed || 1.0;
-    const id = uuidv4();
-    const payload = { id, text, voice: selectedVoice, speed: selectedSpeed, mp3: mp3 || false, mp3_path: mp3_path || null, mp3announce: mp3announce || false };
+async function speakToolHandler({ text, voice, speed, mp3, mp3_path, mp3announce }) {
+  const selectedVoice = voice || state.default_voice;
+  const selectedSpeed = speed || 1.0;
+  const id = uuidv4();
 
-    addToHistory({ ...payload, timestamp: new Date().toISOString() });
-
-    console.log(`[MCP] Received speak request: ${text.substring(0, 50)}...`);
-    try {
-      python.stdin.write(JSON.stringify(payload) + "\n");
-      console.log("[MCP] Request written to Python stdin");
-      return { content: [{ type: "text", text: "Request sent to processor" }] };
-    } catch (error) {
-      console.error(`[MCP] Error writing to Python: ${error.message}`);
-      return { content: [{ type: "text", text: `Error sending request: ${error.message}` }], isError: true };
-    }
+  let resolvedMp3Path = mp3_path || null;
+  if (mp3 && !resolvedMp3Path) {
+    const mp3Dir = "/app/data/mp3";
+    fs.mkdirSync(mp3Dir, { recursive: true });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    resolvedMp3Path = path.join(mp3Dir, `tts-${timestamp}.mp3`);
   }
-);
+
+  const payload = { id, text, voice: selectedVoice, speed: selectedSpeed, mp3: mp3 || false, mp3_path: resolvedMp3Path, mp3announce: mp3announce || false };
+  addToHistory({ ...payload, timestamp: new Date().toISOString() });
+
+  console.log(`[MCP] Received speak request: ${text.substring(0, 50)}...`);
+  try {
+    python.stdin.write(JSON.stringify(payload) + "\n");
+    console.log("[MCP] Request written to Python stdin");
+    const resultText = mp3 ? `MP3 will be saved to ${resolvedMp3Path}` : "Request sent to processor";
+    return { content: [{ type: "text", text: resultText }] };
+  } catch (error) {
+    console.error(`[MCP] Error writing to Python: ${error.message}`);
+    return { content: [{ type: "text", text: `Error sending request: ${error.message}` }], isError: true };
+  }
+}
+
+function createMcpServer() {
+  const server = new McpServer({ name: "tts-kokoro-processor-mcp", version: "1.0.0" });
+  server.tool("speak", speakToolParams, speakToolHandler);
+  return server;
+}
 
 const app = express();
 app.use(cors());
@@ -123,7 +134,17 @@ app.post("/api/speak", jsonParser, (req, res) => {
   if (!text) return res.status(400).json({ error: "Text is required" });
 
   const id = uuidv4();
-  const payload = { id, text, voice: voice || state.default_voice, speed: speed || 1.0, mp3: mp3 || false, mp3_path: mp3_path || null, mp3announce: mp3announce || false };
+
+  // Auto-generate mp3_path if mp3 mode requested without a path
+  let resolvedMp3Path = mp3_path || null;
+  if (mp3 && !resolvedMp3Path) {
+    const mp3Dir = "/app/data/mp3";
+    fs.mkdirSync(mp3Dir, { recursive: true });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    resolvedMp3Path = path.join(mp3Dir, `tts-${timestamp}.mp3`);
+  }
+
+  const payload = { id, text, voice: voice || state.default_voice, speed: speed || 1.0, mp3: mp3 || false, mp3_path: resolvedMp3Path, mp3announce: mp3announce || false };
 
   console.error(`[API] Received speak request: ${text.substring(0, 50)}...`);
   addToHistory({ ...payload, timestamp: new Date().toISOString() });
@@ -186,21 +207,47 @@ app.post("/api/server", jsonParser, (req, res) => {
   }
 });
 
-let transport;
+// Streamable HTTP transport - stateful mode with per-session server instances
+const sessions = {};
 
-app.get("/sse", async (req, res) => {
-  console.log("New SSE connection established");
-  transport = new SSEServerTransport("/messages", res);
-  await server.connect(transport);
-});
+app.all('/mcp', jsonParser, async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'];
 
-app.post("/messages", async (req, res) => {
-  if (transport) {
-    await transport.handlePostMessage(req, res);
-  } else {
-    res.status(400).send("No active transport");
+  try {
+    if (sessionId && sessions[sessionId]) {
+      await sessions[sessionId].transport.handleRequest(req, res, req.body);
+      return;
+    }
+
+    if (!sessionId) {
+      const mcpServer = createMcpServer();
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => uuidv4(),
+        onsessioninitialized: (sid) => {
+          sessions[sid] = { server: mcpServer, transport };
+          console.log('[MCP] Session created:', sid);
+        }
+      });
+      transport.onclose = () => {
+        const sid = transport.sessionId;
+        if (sid && sessions[sid]) {
+          sessions[sid].server.close();
+          delete sessions[sid];
+          console.log('[MCP] Session closed:', sid);
+        }
+      };
+      await mcpServer.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+      return;
+    }
+
+    res.status(404).json({ error: 'Session not found' });
+  } catch(e) {
+    console.error('[MCP] handleRequest error:', e.message);
+    if (!res.headersSent) res.status(500).json({ error: e.message });
   }
 });
+console.log('[MCP] Streamable HTTP route registered (stateful session mode)');
 
 const httpServer = http.createServer(app);
 const wss = new WebSocketServer({ server: httpServer });
@@ -219,6 +266,11 @@ wss.on("connection", (ws) => {
 
 const PORT = process.env.PORT || 3001;
 httpServer.listen(PORT, () => {
-  console.log(`Kokoro TTS Processor MCP Server running on SSE at http://localhost:${PORT}/sse`);
+  console.log(`Kokoro TTS Processor MCP Server running on Streamable HTTP at http://localhost:${PORT}/mcp`);
   console.log(`Dashboard API available at http://localhost:${PORT}/api`);
+
+  // Start reverse-client connection to the broker hub
+  startReverseClient({ state, python, addToHistory }).catch(err => {
+    console.error(`[reverse-client] Startup error: ${err.message}`);
+  });
 });
