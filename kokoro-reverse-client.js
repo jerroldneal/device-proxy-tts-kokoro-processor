@@ -11,6 +11,7 @@
  */
 
 import { v4 as uuidv4 } from "uuid";
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 
@@ -75,6 +76,100 @@ function buildSpeakPayload({ text, voice, speed, mp3, mp3_path, mp3announce }, s
     mp3_path: resolvedMp3Path,
     mp3announce: mp3announce || false,
   };
+}
+
+/** System prompt for AI narrative generation */
+const PRESENT_SYSTEM_PROMPT = `You are a presentation narrator. Transform the following document section into a natural, spoken narrative suitable for a TED Talk style presentation.
+
+Rules:
+- Convert bullet points into flowing sentences
+- Describe diagrams and code conceptually rather than reading them literally
+- Use transitions between ideas ("Now, let's look at...", "The key insight here is...")
+- Keep technical accuracy but use conversational language
+- For code blocks: explain what the code does and why, don't read syntax
+- For Mermaid diagrams: describe the flow, relationships, or architecture depicted
+- For tables: summarize the key data points narratively
+- Output ONLY the spoken narrative text — no markdown, no formatting, no asterisks, no bullet characters
+- Keep it concise — aim for 2-4 sentences per section unless the content is dense
+- Never start with "Sure" or "Here's" — start speaking as if you are presenting`;
+
+/** In-memory presentation cache (keyed by presentation ID) */
+const presentations = new Map();
+
+/**
+ * Split a markdown document into logical sections by heading boundaries.
+ * Code blocks, Mermaid diagrams, and tables are kept within their parent section.
+ *
+ * @param {string} markdown - The full markdown text
+ * @returns {Array<{heading: string, content: string, type: string}>} Sections
+ */
+function splitMarkdownSections(markdown) {
+  if (!markdown || typeof markdown !== "string") return [];
+
+  const lines = markdown.split("\n");
+  const sections = [];
+  let currentHeading = "Introduction";
+  let currentLines = [];
+  let currentType = "text";
+
+  for (const line of lines) {
+    const headingMatch = line.match(/^(#{1,4})\s+(.+)/);
+    if (headingMatch) {
+      // Flush previous section
+      const content = currentLines.join("\n").trim();
+      if (content.length > 0) {
+        sections.push({ heading: currentHeading, content, type: currentType });
+      }
+      currentHeading = headingMatch[2].trim();
+      currentLines = [];
+      currentType = "text";
+    } else {
+      currentLines.push(line);
+      // Detect section types from content
+      if (line.startsWith("```mermaid")) currentType = "diagram";
+      else if (line.startsWith("```") && currentType !== "diagram") currentType = "code";
+      else if (line.startsWith("|") && line.includes("|")) currentType = "table";
+    }
+  }
+
+  // Flush final section
+  const content = currentLines.join("\n").trim();
+  if (content.length > 0) {
+    sections.push({ heading: currentHeading, content, type: currentType });
+  }
+
+  return sections;
+}
+
+/**
+ * Transform a section to spoken narrative using AI (Ollama via reverse-server chat proxy).
+ *
+ * @param {object} rc - The ReverseClient instance
+ * @param {string} sectionContent - The raw markdown section content
+ * @param {string} sectionHeading - The heading for context
+ * @param {string} [model] - Ollama model to use
+ * @returns {Promise<string>} The spoken narrative text
+ */
+async function transformSectionWithAI(rc, sectionContent, sectionHeading, model) {
+  try {
+    const response = await rc.chat({
+      model: model || "qwen2.5:3b",
+      messages: [
+        { role: "system", content: PRESENT_SYSTEM_PROMPT },
+        { role: "user", content: `Section: "${sectionHeading}"\n\n${sectionContent}` },
+      ],
+    }, { timeout: 120000 });
+
+    return response?.payload?.message?.content || response?.message?.content || sectionContent;
+  } catch (err) {
+    console.error(`[present] AI transform failed for "${sectionHeading}": ${err.message}`);
+    // Fallback: strip markdown formatting for a basic spoken version
+    return sectionContent
+      .replace(/```[\s\S]*?```/g, "(code block omitted)")
+      .replace(/\|[^\n]+\|/g, "")
+      .replace(/[#*_`]/g, "")
+      .trim();
+  }
 }
 
 /**
@@ -395,6 +490,200 @@ export async function startReverseClient({ state, python, addToHistory, reverseS
         }
       }
       return `Narration queued: ${paragraphs.length} paragraph(s)\n${results.join("\n")}`;
+    },
+  });
+
+  // ─── Presentation Tools (AI-Powered Document Presenting) ───────────────
+
+  rc.addTool({
+    name: "present",
+    description: "Present a document as a TED Talk — AI transforms each section into spoken narrative using Ollama, then speaks through TTS. Encapsulates the full Present Document SOP.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "Full markdown document text to present" },
+        voice: { type: "string", description: "Voice ID for narration (default: current default voice)" },
+        speed: { type: "number", description: "Speech speed (default: 0.9 for presentations)" },
+        model: { type: "string", description: "Ollama model for narrative generation (default: qwen2.5:3b)" },
+      },
+      required: ["text"],
+    },
+    handler: async (args) => {
+      if (!args.text || typeof args.text !== "string") return "Error: text is required";
+
+      const sections = splitMarkdownSections(args.text);
+      if (sections.length === 0) return "No sections found in the document.";
+
+      const speed = args.speed || 0.9;
+      const voice = args.voice || state.default_voice;
+      const results = [];
+
+      console.log(`[present] Starting presentation with ${sections.length} section(s), model: ${args.model || "qwen2.5:3b"}`);
+
+      for (let i = 0; i < sections.length; i++) {
+        const section = sections[i];
+        console.log(`[present] Section ${i + 1}/${sections.length}: "${section.heading}"`);
+
+        // Transform section with AI
+        const narrative = await transformSectionWithAI(rc, section.content, section.heading, args.model);
+
+        // Speak the narrative
+        const payload = buildSpeakPayload({ text: narrative, voice, speed }, state);
+        addToHistory({ ...payload, timestamp: new Date().toISOString(), presentSection: section.heading });
+
+        try {
+          await sendToProcessor(python, payload);
+          results.push(`✓ Section ${i + 1}: "${section.heading}"`);
+        } catch (err) {
+          results.push(`✗ Section ${i + 1}: "${section.heading}" — ${err.message}`);
+        }
+      }
+
+      return `Presentation complete: ${sections.length} section(s)\n${results.join("\n")}`;
+    },
+  });
+
+  rc.addTool({
+    name: "prepare_presentation",
+    description: "Generate a presentation script from a document using AI, without speaking it. Returns a presentation ID that can be used with present_cached or get_presentation. Allows reviewing and editing before delivery.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "Full markdown document text to transform" },
+        title: { type: "string", description: "Title for this presentation (auto-generated if omitted)" },
+        model: { type: "string", description: "Ollama model for narrative generation (default: qwen2.5:3b)" },
+      },
+      required: ["text"],
+    },
+    handler: async (args) => {
+      if (!args.text || typeof args.text !== "string") return "Error: text is required";
+
+      const sections = splitMarkdownSections(args.text);
+      if (sections.length === 0) return "No sections found in the document.";
+
+      const presentationId = crypto.randomBytes(6).toString("hex");
+      const title = args.title || sections[0]?.heading || "Untitled Presentation";
+      const narrativeSections = [];
+
+      console.log(`[present] Preparing presentation "${title}" (${presentationId}) with ${sections.length} section(s)`);
+
+      for (let i = 0; i < sections.length; i++) {
+        const section = sections[i];
+        console.log(`[present] Transforming section ${i + 1}/${sections.length}: "${section.heading}"`);
+        const narrative = await transformSectionWithAI(rc, section.content, section.heading, args.model);
+        narrativeSections.push({
+          index: i + 1,
+          heading: section.heading,
+          type: section.type,
+          originalContent: section.content.substring(0, 200),
+          narrative,
+        });
+      }
+
+      const presentation = {
+        id: presentationId,
+        title,
+        createdAt: new Date().toISOString(),
+        model: args.model || "qwen2.5:3b",
+        sectionCount: narrativeSections.length,
+        sections: narrativeSections,
+      };
+
+      presentations.set(presentationId, presentation);
+      console.log(`[present] Presentation "${title}" (${presentationId}) prepared with ${narrativeSections.length} section(s)`);
+
+      return JSON.stringify({
+        id: presentationId,
+        title,
+        sectionCount: narrativeSections.length,
+        sections: narrativeSections.map(s => ({
+          index: s.index,
+          heading: s.heading,
+          narrativePreview: s.narrative.substring(0, 120) + (s.narrative.length > 120 ? "..." : ""),
+        })),
+        message: `Presentation prepared. Use present_cached with id "${presentationId}" to deliver it, or get_presentation to review the full script.`,
+      }, null, 2);
+    },
+  });
+
+  rc.addTool({
+    name: "present_cached",
+    description: "Deliver a previously prepared presentation by its ID. Speaks each section through TTS.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Presentation ID from prepare_presentation" },
+        voice: { type: "string", description: "Voice ID for narration" },
+        speed: { type: "number", description: "Speech speed (default: 0.9)" },
+      },
+      required: ["id"],
+    },
+    handler: async (args) => {
+      if (!args.id || typeof args.id !== "string") return "Error: presentation ID is required";
+
+      const presentation = presentations.get(args.id);
+      if (!presentation) return `Presentation "${args.id}" not found. Use list_presentations to see available presentations.`;
+
+      const speed = args.speed || 0.9;
+      const voice = args.voice || state.default_voice;
+      const results = [];
+
+      console.log(`[present] Delivering cached presentation "${presentation.title}" (${args.id})`);
+
+      for (const section of presentation.sections) {
+        const payload = buildSpeakPayload({ text: section.narrative, voice, speed }, state);
+        addToHistory({ ...payload, timestamp: new Date().toISOString(), presentSection: section.heading });
+
+        try {
+          await sendToProcessor(python, payload);
+          results.push(`✓ Section ${section.index}: "${section.heading}"`);
+        } catch (err) {
+          results.push(`✗ Section ${section.index}: "${section.heading}" — ${err.message}`);
+        }
+      }
+
+      return `Presentation "${presentation.title}" delivered: ${presentation.sections.length} section(s)\n${results.join("\n")}`;
+    },
+  });
+
+  rc.addTool({
+    name: "get_presentation",
+    description: "Retrieve the full script of a previously prepared presentation, including all section narratives",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Presentation ID" },
+      },
+      required: ["id"],
+    },
+    handler: async (args) => {
+      if (!args.id || typeof args.id !== "string") return "Error: presentation ID is required";
+
+      const presentation = presentations.get(args.id);
+      if (!presentation) return `Presentation "${args.id}" not found. Use list_presentations to see available presentations.`;
+
+      return JSON.stringify(presentation, null, 2);
+    },
+  });
+
+  rc.addTool({
+    name: "list_presentations",
+    description: "List all cached presentation scripts with their IDs, titles, and section counts",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => {
+      if (presentations.size === 0) return "No cached presentations. Use prepare_presentation to create one.";
+
+      const list = [];
+      for (const [id, p] of presentations) {
+        list.push({
+          id,
+          title: p.title,
+          sectionCount: p.sectionCount,
+          model: p.model,
+          createdAt: p.createdAt,
+        });
+      }
+      return JSON.stringify(list, null, 2);
     },
   });
 

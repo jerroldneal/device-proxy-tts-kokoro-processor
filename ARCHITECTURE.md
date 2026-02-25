@@ -167,11 +167,11 @@ graph TD
 1.  **On startup**, after the HTTP server is listening, `mcp_server.js` calls `startReverseClient()` from `kokoro-reverse-client.js`.
 2.  The module dynamically imports the `ReverseClient` SDK (mounted from `mcp-reverse-client/sdk.js` into the container as `/app/reverse-client-sdk.js`).
 3.  A `ReverseClient` instance registers as `kokoro-tts` with the reverse-server at `ws://host.docker.internal:3099`.
-4.  **14 tools** are published across 5 categories (see below).
+4.  **19 tools** are published across 6 categories (see below).
 5.  Any MCP client connected to the reverse-server sees these tools namespaced as `kokoro-tts__<tool_name>`.
 6.  Auto-reconnect ensures the tools re-appear if the reverse-server restarts.
 
-### Published Tools (14 total)
+### Published Tools (19 total)
 
 | Category | Tool | Description |
 |----------|------|-------------|
@@ -189,12 +189,51 @@ graph TD
 | **Control** | `ping` | Health check with uptime |
 | | `get_capabilities` | Full feature list, voices, config |
 | **Batch** | `narrate_document` | Split document into paragraphs and queue |
+| **Presentation** | `present` | AI-powered TED Talk style document presentation |
+| | `prepare_presentation` | Generate narrative script without speaking (preview/edit) |
+| | `present_cached` | Deliver a previously prepared presentation |
+| | `get_presentation` | Retrieve full script of a cached presentation |
+| | `list_presentations` | List all cached presentation scripts |
 
 ### Configuration
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
 | `REVERSE_SERVER_URL` | `ws://host.docker.internal:3099` | WebSocket URL of the reverse-server |
+
+### AI-Powered Presentation Pipeline
+
+The presentation tools use the reverse-client's `chat()` method to proxy requests to Ollama for AI narrative generation. This offloads the "transform document section into spoken narrative" work from Copilot to a local LLM.
+
+```mermaid
+sequenceDiagram
+    participant Caller as MCP Client
+    participant RC as kokoro-reverse-client
+    participant RS as Reverse-Server Hub
+    participant Ollama as Ollama MCP Server
+    participant TTS as Python TTS Processor
+
+    Caller->>RS: present({text: "# Doc..."})
+    RS->>RC: tool_call(present, args)
+    loop For each markdown section
+        RC->>RS: chat_request({model, messages})
+        RS->>Ollama: MCP callTool(request, {prompt, system})
+        Ollama-->>RS: narrative text
+        RS-->>RC: chat_response({message})
+        RC->>TTS: speak(narrative)
+        TTS-->>RC: queued
+    end
+    RC-->>RS: tool_result(summary)
+    RS-->>Caller: result
+```
+
+**Key design choices:**
+- Sections are split by markdown heading boundaries (`#`, `##`, `###`, `####`)
+- Each section is individually transformed by AI with a presentation narrator system prompt
+- Code blocks, Mermaid diagrams, and tables are described conceptually, not read literally
+- `prepare_presentation` allows reviewing and editing the AI-generated narrative before delivery
+- Cached presentations are stored in memory and can be replayed with `present_cached`
+- If the AI chat fails for a section, a fallback strips markdown formatting for basic spoken text
 
 ### Graceful Degradation
 
