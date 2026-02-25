@@ -1,29 +1,31 @@
-version: '3.8'
-
 services:
   tts-kokoro-processor:
     build: .
     container_name: tts-kokoro-processor-instance
+    # NOTE: GPU enabled using 'deploy' syntax (works with Docker Compose v2 + WSL2)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - USE_GPU=true
+    ports:
+      - "3021:3001"
     volumes:
-      - c:/.tts:/app/data
+      - ~/.tts:/app/data
+      - ~/temp:/app/temp
       - kokoro_hf_cache:/root/.cache/huggingface
       - ./processor.py:/app/processor.py
-      # Hot-swap the audio proxy with the Python version
+      # Hot-swap the audio proxy with the Python version (disabled - files don't exist)
       # - ../pipes/audio-driver-proxy/forward_pipe.py:/app/forward_pipe.py
       # - ../pipes/audio-driver-proxy/forward_pipe_shim.sh:/app/forward_pipe.sh
     env_file:
       - .env
-    ports:
-      - "3021:3001"
-    restart: unless-stopped
-
-  tts-dashboard:
-    build: ./dashboard
-    container_name: tts-dashboard-instance
-    ports:
-      - "3022:80"
     restart: unless-stopped
 
 volumes:
   kokoro_hf_cache:
-

@@ -1,4 +1,4 @@
-FROM audio-driver-proxy:latest
+FROM python:3.10-slim
 
 # Keep Python from buffering stdout and stderr
 ENV PYTHONUNBUFFERED=1
@@ -16,7 +16,6 @@ RUN apt-get update && apt-get install -y \
     git \
     mpv \
     curl \
-    socat \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js (LTS)
@@ -38,7 +37,7 @@ COPY package.json .
 RUN npm install
 COPY mcp_server.js .
 COPY --chmod=0755 start.sh .
-COPY --chmod=0755 forward_pipe.sh .
+RUN sed -i 's/\r$//' start.sh
 
 # Create data directories
 RUN mkdir -p /app/data/todo /app/data/working /app/data/done

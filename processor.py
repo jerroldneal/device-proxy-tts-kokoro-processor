@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import soundfile as sf
 import numpy as np
+import torch
 from kokoro import KPipeline
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -21,15 +22,7 @@ import queue
 import re
 import sys
 import json
-import uuid
-import logging
-
-# Configure logging
-logging.basicConfig(
-    filename='/app/data/processor.log',
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+import socket
 
 # Configuration
 DATA_DIR = "/app/data"
@@ -58,71 +51,52 @@ audio_queue = queue.Queue()
 # Event to wake up the file watcher
 fs_event = threading.Event()
 
-def emit_status(type, **kwargs):
-    """Emit a JSON status message to stdout."""
-    msg = {"type": type, "timestamp": time.time()}
-    msg.update(kwargs)
-    print(json.dumps(msg), flush=True)
-    logging.info(f"Status Emitted: {json.dumps(msg)}")
-
 class AudioChunk:
-    def __init__(self, audio_data, sample_rate, volume, source_id, is_end_of_file=False):
+    def __init__(self, audio_data, sample_rate, volume, source_id, is_end_of_file=False, mp3_info=None):
         self.audio_data = audio_data
         self.sample_rate = sample_rate
         self.volume = volume
         self.source_id = source_id
         self.is_end_of_file = is_end_of_file
+        self.mp3_info = mp3_info  # Dict with mp3_path and accumulated audio
 
-class PipePlayer:
-    def __init__(self, pipe_path="/tmp/audio_pipe", sample_rate=24000, target_rate=48000):
-        self.pipe_path = pipe_path
+class TCPPlayer:
+    def __init__(self, host="host.docker.internal", port=3007, sample_rate=24000, target_rate=48000):
+        self.host = host
+        self.port = port
         self.sample_rate = sample_rate
         self.target_rate = target_rate
-        self.pipe = None
-        # Don't block init, connect on first write
+        self.socket = None
 
-    def connect_pipe(self):
-        if self.pipe:
-            try: self.pipe.close()
-            except: pass
-            self.pipe = None
-
-        if not os.path.exists(self.pipe_path):
-            # Wait for proxy to create it
-            return False
+    def connect_socket(self):
+        if self.socket:
+            try:
+                self.socket.close()
+            except:
+                pass
+            self.socket = None
 
         try:
-            # Open for writing. This blocks until a reader is connected.
-            # Since we are in a worker thread, blocking is acceptable but we should timeout?
-            # Python open() doesn't support timeout.
-            # We rely on the proxy being up.
-            # print(f"PipePlayer: Opening {self.pipe_path}...")
-            self.pipe = open(self.pipe_path, 'wb')
-            # print("PipePlayer: Connected.")
+            print(f"TCPPlayer: Connecting to {self.host}:{self.port}...")
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.connect((self.host, self.port))
+            print("TCPPlayer: Connected.")
             return True
         except Exception as e:
-            # print(f"PipePlayer: Failed to open pipe: {e}")
-            self.pipe = None
+            print(f"TCPPlayer: Failed to connect: {e}")
+            self.socket = None
             return False
 
     def play_chunk(self, audio_data, volume=100):
-        if self.pipe is None:
-            if not self.connect_pipe():
-                # If we can't connect, we drop the chunk to avoid hanging forever?
-                # Or we retry?
+        if self.socket is None:
+            if not self.connect_socket():
                 time.sleep(0.1)
                 return
 
         # Resample 24k -> 48k
         if self.target_rate == 48000 and self.sample_rate == 24000:
-            # Linear interpolation
             x = np.arange(len(audio_data))
             x_new = np.arange(0, len(audio_data), 0.5)
-            # Note: x_new might be slightly larger/smaller depending on float precision,
-            # but np.interp handles it.
-            # Actually, x_new length should be exactly 2x.
-            # Let's use linspace for exactness?
-            # No, arange is fine.
             audio_data = np.interp(x_new, x, audio_data)
 
         # Apply volume
@@ -135,21 +109,13 @@ class PipePlayer:
         audio_int16 = (audio_data * 32767).astype(np.int16)
 
         try:
-            self.pipe.write(audio_int16.tobytes())
-            # self.pipe.flush() # Let OS buffer for smoother streaming
-        except BrokenPipeError:
-            # print("PipePlayer: Broken pipe. Reconnecting...")
-            self.connect_pipe()
+            self.socket.sendall(audio_int16.tobytes())
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            print(f"TCPPlayer: Connection lost ({e}). Reconnecting...")
+            self.connect_socket()
         except Exception as e:
-            # print(f"PipePlayer: Write error: {e}")
-            self.connect_pipe()
-
-    def flush(self):
-        if self.pipe:
-            try:
-                self.pipe.flush()
-            except:
-                pass
+            print(f"TCPPlayer: Send error: {e}")
+            self.connect_socket()
 
 class QueueHandler(FileSystemEventHandler):
     def on_created(self, event):
@@ -160,14 +126,57 @@ class QueueHandler(FileSystemEventHandler):
         if not event.is_directory:
             fs_event.set()
 
+def get_device():
+    """Detect and return the best available device for inference."""
+    use_gpu = os.getenv('USE_GPU', 'true').lower() == 'true'
+
+    if not use_gpu:
+        print("GPU disabled via USE_GPU=false")
+        return 'cpu'
+
+    if torch.cuda.is_available():
+        device = 'cuda'
+        print(f"CUDA available: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA version: {torch.version.cuda}")
+        return device
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        print("MPS (Apple Silicon) available")
+        return 'mps'
+    else:
+        print("No GPU available, falling back to CPU")
+        return 'cpu'
+
 def initialize_pipeline():
     global pipeline
-    # print("Initializing Kokoro Pipeline...")
-    emit_status("info", message="Initializing Kokoro Pipeline...")
+    print("Initializing Kokoro Pipeline...")
+
+    device = get_device()
+    print(f"Using device: {device}")
+
+    # Initialize pipeline
     pipeline = KPipeline(lang_code=LANG_CODE)
-    # print("Kokoro Pipeline Initialized.")
-    emit_status("info", message="Kokoro Pipeline Initialized.")
-    emit_status("status", state="ready")
+
+    # Move model to GPU if available
+    if device == 'cuda':
+        try:
+            pipeline.model = pipeline.model.cuda()
+            print("Model successfully moved to CUDA")
+            # Print GPU memory info
+            if torch.cuda.is_available():
+                print(f"GPU Memory Allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
+                print(f"GPU Memory Reserved: {torch.cuda.memory_reserved(0) / 1024**2:.2f} MB")
+        except Exception as e:
+            print(f"Warning: Failed to move model to CUDA: {e}")
+            print("Falling back to CPU")
+    elif device == 'mps':
+        try:
+            pipeline.model = pipeline.model.to(torch.device('mps'))
+            print("Model successfully moved to MPS")
+        except Exception as e:
+            print(f"Warning: Failed to move model to MPS: {e}")
+            print("Falling back to CPU")
+
+    print("Kokoro Pipeline Initialized.")
 
 def parse_segments(text):
     parts = re.split(r'(\{[a-zA-Z]+:[^}]+\})', text)
@@ -201,56 +210,60 @@ def generator_worker():
 
             # Determine if task is file path or memory object
             is_file = isinstance(task, str)
-            source_id = task if is_file else task.get('id', str(uuid.uuid4()))
+            source_id = task if is_file else "memory_task"
             text = ""
+            mp3_mode = False
+            mp3_path = None
+            mp3_announce = False
+            accumulated_audio = []
 
             if is_file:
                 file_path = task
                 if not os.path.exists(file_path):
-                    # print(f"Generator: File {file_path} not found. Skipping.")
+                    print(f"Generator: File {file_path} not found. Skipping.")
                     task_queue.task_done()
                     continue
 
-                # print(f"Generator: Processing file {file_path}")
+                print(f"Generator: Processing file {file_path}")
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         text = f.read().strip()
                 except Exception as e:
-                    # print(f"Generator: Error reading file: {e}")
+                    print(f"Generator: Error reading file: {e}")
                     task_queue.task_done()
                     continue
             else:
                 # Memory task
-                # print("Generator: Processing memory task")
+                print("Generator: Processing memory task")
                 text = task.get('text', '')
+                mp3_mode = task.get('mp3', False)
+                mp3_path = task.get('mp3_path')
+                mp3_announce = task.get('mp3announce', False)
+                print(f"Generator: mp3_mode={mp3_mode}, mp3_path={mp3_path}, mp3_announce={mp3_announce}")
                 # Prepend voice/speed tags if present in task object
                 voice = task.get('voice')
                 speed = task.get('speed')
                 prefix = ""
-                if voice: prefix += f"{{voice:{voice}}} "
-                if speed: prefix += f"{{speed:{speed}}} "
+                if voice: prefix += "{{voice:{}}} ".format(voice)
+                if speed: prefix += "{{speed:{}}} ".format(speed)
                 text = prefix + text
 
             if not text:
-                audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True))
+                mp3_info = {'path': mp3_path, 'audio': accumulated_audio, 'announce': mp3_announce} if mp3_mode else None
+                audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True, mp3_info=mp3_info))
                 task_queue.task_done()
                 continue
-
-            emit_status("status", state="processing", text=text, id=source_id)
-            logging.info(f"Generator: Processing text: {text}")
 
             current_voice = DEFAULT_VOICE
             current_speed = 1.0
             current_volume = 100
 
             segments = parse_segments(text)
-            # split_pattern = r'(?<=[\.\?\!])\s+|\n+'
-            # Only split on newlines to avoid pauses between sentences
-            split_pattern = r'\n+'
+            split_pattern = r'(?<=[\.\?\!])\s+|\n+'
 
             for seg in segments:
                 if is_file and not os.path.exists(file_path):
-                    # print(f"Generator: File {file_path} removed. Stopping generation.")
+                    print(f"Generator: File {file_path} removed. Stopping generation.")
                     break
 
                 if seg['type'] == 'command':
@@ -281,27 +294,35 @@ def generator_worker():
                             if hasattr(audio, 'numpy'):
                                 audio = audio.numpy()
 
-                            audio_queue.put(AudioChunk(audio, 24000, current_volume, source_id))
+                            if mp3_mode:
+                                # Accumulate audio for MP3 file
+                                accumulated_audio.append(audio)
+                            else:
+                                # Send to player for immediate playback
+                                audio_queue.put(AudioChunk(audio, 24000, current_volume, source_id))
                     except Exception as e:
-                        # print(f"Generator: Error in pipeline: {e}")
-                        emit_status("error", message=str(e))
+                        print(f"Generator: Error in pipeline: {e}")
 
             if is_file and os.path.exists(file_path):
-                audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True))
+                mp3_info = {'path': mp3_path, 'audio': accumulated_audio, 'announce': mp3_announce} if mp3_mode else None
+                audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True, mp3_info=mp3_info))
             elif not is_file:
-                audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True))
+                mp3_info = {'path': mp3_path, 'audio': accumulated_audio, 'announce': mp3_announce} if mp3_mode else None
+                audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True, mp3_info=mp3_info))
 
             task_queue.task_done()
-            # print(f"Generator: Finished generating {source_id}")
-            emit_status("status", state="idle", id=source_id)
+            print(f"Generator: Finished generating {source_id}")
+
+            # Clean up GPU memory if using CUDA
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         except Exception as e:
-            # print(f"Generator: Critical Error: {e}")
-            emit_status("error", message=str(e))
+            print(f"Generator: Critical Error: {e}")
             time.sleep(1)
 
 def player_worker():
-    player = PipePlayer()
+    player = TCPPlayer()
 
     while True:
         try:
@@ -311,25 +332,55 @@ def player_worker():
             is_file = isinstance(chunk.source_id, str) and chunk.source_id.startswith("/")
 
             if is_file and not os.path.exists(chunk.source_id):
-                # print(f"Player: File {chunk.source_id} removed. Discarding chunk.")
+                print(f"Player: File {chunk.source_id} removed. Discarding chunk.")
                 audio_queue.task_done()
                 continue
 
             if chunk.is_end_of_file:
-                player.flush()
+                # Handle MP3 file creation
+                if chunk.mp3_info and chunk.mp3_info.get('path') and chunk.mp3_info.get('audio'):
+                    mp3_path = chunk.mp3_info['path']
+                    audio_list = chunk.mp3_info['audio']
+
+                    try:
+                        # Concatenate all audio chunks
+                        full_audio = np.concatenate(audio_list)
+
+                        # Save as WAV first, then convert to MP3
+                        wav_path = mp3_path.replace('.mp3', '.wav') if mp3_path.endswith('.mp3') else mp3_path + '.wav'
+                        sf.write(wav_path, full_audio, 24000)
+
+                        # Convert WAV to MP3 using ffmpeg
+                        try:
+                            subprocess.run(['ffmpeg', '-y', '-i', wav_path, '-codec:a', 'libmp3lame', '-qscale:a', '2', mp3_path],
+                                         check=True, capture_output=True)
+                            os.remove(wav_path)  # Clean up WAV file
+                            print(f"Player: MP3 file created at {mp3_path}")
+
+                            # Announce file creation to speaker (only if mp3announce is True)
+                            if chunk.mp3_info.get('announce', False):
+                                announcement = f"MP3 file created at {os.path.basename(mp3_path)}"
+                                announcement_task = {'text': announcement, 'voice': DEFAULT_VOICE, 'speed': 1.0, 'mp3': False}
+                                task_queue.put(announcement_task)
+
+                        except subprocess.CalledProcessError as e:
+                            print(f"Player: Error converting to MP3: {e.stderr.decode()}")
+                            # Fall back to WAV if MP3 conversion fails
+                            print(f"Player: WAV file saved at {wav_path}")
+                    except Exception as e:
+                        print(f"Player: Error creating MP3 file: {e}")
+
                 if is_file:
                     filename = os.path.basename(chunk.source_id)
                     done_path = os.path.join(DONE_DIR, filename)
                     try:
                         if os.path.exists(chunk.source_id):
                             shutil.move(chunk.source_id, done_path)
-                            # print(f"Player: Finished {filename} (Moved to DONE)")
+                            print(f"Player: Finished {filename} (Moved to DONE)")
                     except Exception as e:
-                        # print(f"Player: Error moving file: {e}")
-                        pass
+                        print(f"Player: Error moving file: {e}")
                 else:
-                    # print("Player: Finished memory task")
-                    pass
+                    print("Player: Finished memory task")
 
                 audio_queue.task_done()
                 continue
@@ -341,17 +392,15 @@ def player_worker():
             audio_queue.task_done()
 
         except Exception as e:
-            # print(f"Player: Critical Error: {e}")
+            print(f"Player: Critical Error: {e}")
             time.sleep(1)
 
 def stdin_reader():
-    # print("Stdin Reader: Started")
-    emit_status("info", message="Stdin Reader: Started")
+    print("Stdin Reader: Started")
     while True:
         try:
             line = sys.stdin.readline()
             if not line:
-                emit_status("info", message="Stdin Reader: EOF received")
                 break
             line = line.strip()
             if not line:
@@ -359,21 +408,16 @@ def stdin_reader():
 
             try:
                 data = json.loads(line)
-                emit_status("info", message=f"Stdin Reader: Received task {data.get('id')}")
-                # print(f"Stdin Reader: Received task")
+                print(f"Stdin Reader: Received task")
                 task_queue.put(data)
             except json.JSONDecodeError:
-                emit_status("error", message=f"Stdin Reader: Invalid JSON: {line}")
-                # print(f"Stdin Reader: Invalid JSON received: {line}")
-                pass
+                print(f"Stdin Reader: Invalid JSON received: {line}")
         except Exception as e:
-            emit_status("error", message=f"Stdin Reader Error: {e}")
-            # print(f"Stdin Reader: Error: {e}")
+            print(f"Stdin Reader: Error: {e}")
             time.sleep(1)
 
 def main():
-    # print("Starting TTS Kokoro Processor (Hybrid Mode)...")
-    emit_status("info", message="Starting TTS Kokoro Processor (Hybrid Mode)...")
+    print("Starting TTS Kokoro Processor (Hybrid Mode)...")
 
     os.makedirs(TODO_DIR, exist_ok=True)
     os.makedirs(WORKING_DIR, exist_ok=True)
@@ -389,13 +433,13 @@ def main():
     observer = Observer()
     observer.schedule(event_handler, TODO_DIR, recursive=False)
     observer.start()
-    # print(f"Monitoring {TODO_DIR} and Stdin...")
+    print(f"Monitoring {TODO_DIR} and Stdin...")
 
     # Recover files
     for f in sorted(os.listdir(WORKING_DIR), key=lambda x: os.path.getmtime(os.path.join(WORKING_DIR, x))):
         path = os.path.join(WORKING_DIR, f)
         if os.path.isfile(path):
-            # print(f"Recovering file from WORKING: {f}")
+            print(f"Recovering file from WORKING: {f}")
             task_queue.put(path)
 
     try:
@@ -405,19 +449,19 @@ def main():
                 src = os.path.join(TODO_DIR, todo_file)
                 dst = os.path.join(WORKING_DIR, todo_file)
                 try:
-                    # print(f"Orchestrator: Moving {todo_file} to WORKING")
+                    print(f"Orchestrator: Moving {todo_file} to WORKING")
                     shutil.move(src, dst)
                     task_queue.put(dst)
                     continue
                 except Exception as e:
-                    # print(f"Error moving file: {e}")
+                    print(f"Error moving file: {e}")
                     time.sleep(1)
 
             fs_event.wait(timeout=1.0)
             fs_event.clear()
 
     except KeyboardInterrupt:
-        # print("Stopping...")
+        print("Stopping...")
         observer.stop()
         observer.join()
 

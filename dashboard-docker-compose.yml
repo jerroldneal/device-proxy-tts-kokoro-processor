@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  tts-dashboard:
+    image: nginx:alpine
+    container_name: tts-dashboard-instance
+    ports:
+      - "3022:80"
+    volumes:
+      - ./dashboard.html:/usr/share/nginx/html/index.html:ro
+    restart: unless-stopped
