@@ -1,5 +1,7 @@
 # TTS Kokoro Processor
 
+> **Repo**: [`jerroldneal/device-proxy-tts-kokoro-processor`](https://github.com/jerroldneal/device-proxy-tts-kokoro-processor) · **Submodule of**: [`chrome-native-relay`](https://github.com/jerroldneal/chrome-native-relay) at `tts-kokoro-processor/`
+
 A Python service that monitors a folder for text files and speaks them using the **Kokoro** open-weight TTS model (82M parameters). This service provides both file-based and MCP (Model Context Protocol) interfaces for text-to-speech generation.
 
 ## ⚠️ CRITICAL: Named Pipe Dependency
