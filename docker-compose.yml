@@ -14,6 +14,7 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - USE_GPU=true
       - REVERSE_SERVER_URL=ws://host.docker.internal:3099
+      - MP3_HOST_PREFIX=~/.tts
     ports:
       - "3021:3001"
     volumes:

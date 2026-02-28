@@ -15,6 +15,26 @@ import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 
+// Path Translation: container paths ↔ host paths
+const CONTAINER_DATA_PREFIX = "/app/data";
+const MP3_HOST_PREFIX = process.env.MP3_HOST_PREFIX || "~/.tts";
+
+function containerToHostPath(containerPath) {
+  if (!containerPath) return containerPath;
+  if (containerPath.startsWith(CONTAINER_DATA_PREFIX)) {
+    return MP3_HOST_PREFIX + containerPath.slice(CONTAINER_DATA_PREFIX.length);
+  }
+  return containerPath;
+}
+
+function hostToContainerPath(hostPath) {
+  if (!hostPath) return hostPath;
+  if (hostPath.startsWith(MP3_HOST_PREFIX)) {
+    return CONTAINER_DATA_PREFIX + hostPath.slice(MP3_HOST_PREFIX.length);
+  }
+  return hostPath;
+}
+
 /** All available Kokoro voices with descriptions */
 const AVAILABLE_VOICES = [
   { id: "af_heart", name: "Heart", gender: "female", accent: "american", description: "Warm, expressive female voice (default)" },
@@ -43,7 +63,8 @@ function sendToProcessor(python, payload) {
         if (err) {
           reject(new Error(`Failed to write to processor: ${err.message}`));
         } else {
-          resolve(payload.mp3 ? `MP3 will be saved to ${payload.mp3_path}` : "Request sent to processor");
+          const hostPath = containerToHostPath(payload.mp3_path);
+          resolve(payload.mp3 ? `MP3 will be saved to ${hostPath}` : "Request sent to processor");
         }
       });
     } catch (err) {
@@ -60,7 +81,8 @@ function sendToProcessor(python, payload) {
  */
 function buildSpeakPayload({ text, voice, speed, mp3, mp3_path, mp3announce }, state) {
   const id = uuidv4();
-  let resolvedMp3Path = mp3_path || null;
+  // Translate host path to container path if provided
+  let resolvedMp3Path = mp3_path ? hostToContainerPath(mp3_path) : null;
   if (mp3 && !resolvedMp3Path) {
     const mp3Dir = "/app/data/mp3";
     fs.mkdirSync(mp3Dir, { recursive: true });
@@ -95,6 +117,42 @@ Rules:
 
 /** In-memory presentation cache (keyed by presentation ID) */
 const presentations = new Map();
+
+/**
+ * Split long text into sections at sentence/paragraph boundaries for MP3 combining.
+ * @param {string} text - The full text
+ * @param {number} maxChars - Max characters per section
+ * @returns {string[]} Array of text sections
+ */
+function splitTextForCombine(text, maxChars) {
+  if (text.length <= maxChars) return [text];
+
+  const sections = [];
+  const paragraphs = text.split(/\n\s*\n/).filter(p => p.trim().length > 0);
+  let current = "";
+
+  for (const para of paragraphs) {
+    if (current.length + para.length + 2 > maxChars && current.length > 0) {
+      sections.push(current.trim());
+      current = "";
+    }
+    if (para.length > maxChars) {
+      if (current.length > 0) { sections.push(current.trim()); current = ""; }
+      const sentences = para.split(/(?<=[.!?])\s+/);
+      for (const sentence of sentences) {
+        if (current.length + sentence.length + 1 > maxChars && current.length > 0) {
+          sections.push(current.trim());
+          current = "";
+        }
+        current += (current ? " " : "") + sentence;
+      }
+    } else {
+      current += (current ? "\n\n" : "") + para;
+    }
+  }
+  if (current.trim().length > 0) sections.push(current.trim());
+  return sections.length > 0 ? sections : [text];
+}
 
 /**
  * Split a markdown document into logical sections by heading boundaries.
@@ -684,6 +742,200 @@ export async function startReverseClient({ state, python, addToHistory, reverseS
         });
       }
       return JSON.stringify(list, null, 2);
+    },
+  });
+
+  // ─── MP3 Combine Tool ─────────────────────────────────────────────────
+
+  rc.addTool({
+    name: "speak_mp3_combined",
+    description: "Convert long text to a single combined MP3 file. Automatically splits text into sections, generates individual MP3 parts, then combines them. Ideal for long documents, articles, or books.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "Full text to convert to combined MP3" },
+        voice: { type: "string", description: "Voice ID for narration" },
+        speed: { type: "number", description: "Speed of speech (default: 1.0)" },
+        mp3_path: { type: "string", description: "Output path for combined MP3 file (host path, auto-generated if omitted)" },
+        max_chars_per_section: { type: "number", description: "Max characters per section before splitting (default: 5000)" },
+        cleanup_parts: { type: "boolean", description: "Remove part files after combining (default: true)" },
+      },
+      required: ["text"],
+    },
+    handler: async (args) => {
+      if (!args.text || typeof args.text !== "string") return "Error: text is required";
+      const maxChars = args.max_chars_per_section || 5000;
+      const sections = splitTextForCombine(args.text, maxChars);
+      const jobId = uuidv4();
+      const selectedVoice = args.voice || state.default_voice;
+      const selectedSpeed = args.speed || 1.0;
+
+      let containerOutputPath = args.mp3_path ? hostToContainerPath(args.mp3_path) : null;
+      if (!containerOutputPath) {
+        const mp3Dir = "/app/data/mp3";
+        fs.mkdirSync(mp3Dir, { recursive: true });
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+        containerOutputPath = path.join(mp3Dir, `tts-combined-${timestamp}.mp3`);
+      }
+
+      const baseName = containerOutputPath.replace(/\.mp3$/i, "");
+      const partPaths = sections.map((_, i) => `${baseName}-part-${String(i + 1).padStart(3, "0")}.mp3`);
+
+      // Register job in state
+      if (!state.jobs) state.jobs = new Map();
+      state.jobs.set(jobId, {
+        id: jobId, type: "combine", status: "generating", totalParts: sections.length,
+        completedParts: 0, percent: 0, phase: "generating", partPaths,
+        outputPath: containerOutputPath, cleanupParts: args.cleanup_parts !== false,
+        createdAt: new Date().toISOString()
+      });
+
+      for (let i = 0; i < sections.length; i++) {
+        const partPayload = {
+          id: uuidv4(), jobId, text: sections[i], voice: selectedVoice,
+          speed: selectedSpeed, mp3: true, mp3_path: partPaths[i], mp3announce: false
+        };
+        addToHistory({ ...partPayload, timestamp: new Date().toISOString() });
+        await sendToProcessor(python, partPayload);
+      }
+
+      const hostOutputPath = containerToHostPath(containerOutputPath);
+      return `MP3 combine job started (${jobId}). ${sections.length} section(s) queued. Output: ${hostOutputPath}. Use get_job_status to track progress.`;
+    },
+  });
+
+  // ─── Notification / Progress Tools ─────────────────────────────────────
+
+  rc.addTool({
+    name: "get_notifications",
+    description: "Get current processor status notifications including idle/processing state, MP3 generation progress (% complete), streaming progress, and active job details",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => {
+      const jobs = [];
+      if (state.jobs) {
+        for (const [id, job] of state.jobs) {
+          jobs.push({ id, type: job.type, status: job.status, percent: job.percent, phase: job.phase, outputPath: containerToHostPath(job.outputPath) });
+        }
+      }
+      return JSON.stringify({
+        processorStatus: state.status,
+        playback: state.playback || { paused: false },
+        activeJobs: jobs,
+        defaultVoice: state.default_voice,
+        historyCount: state.history.length
+      }, null, 2);
+    },
+  });
+
+  rc.addTool({
+    name: "get_job_status",
+    description: "Get detailed status of an MP3 combine job or all active jobs",
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", description: "Job ID to check (omit for all active jobs)" },
+      },
+    },
+    handler: async ({ job_id }) => {
+      if (!state.jobs || state.jobs.size === 0) return "No active jobs.";
+      if (job_id) {
+        const job = state.jobs.get(job_id);
+        if (!job) return `Job "${job_id}" not found.`;
+        return JSON.stringify({ ...job, outputPath: containerToHostPath(job.outputPath) }, null, 2);
+      }
+      const all = [];
+      for (const [id, job] of state.jobs) {
+        all.push({ id, type: job.type, status: job.status, percent: job.percent, phase: job.phase, outputPath: containerToHostPath(job.outputPath) });
+      }
+      return JSON.stringify(all, null, 2);
+    },
+  });
+
+  // ─── Playback Controls ─────────────────────────────────────────────────
+
+  function sendControlFromRC(command, params = {}) {
+    const msg = { type: "control", command, ...params };
+    python.stdin.write(JSON.stringify(msg) + "\n");
+  }
+
+  rc.addTool({
+    name: "pause_playback",
+    description: "Pause the current TTS playback. Audio output stops but position is remembered.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => {
+      sendControlFromRC("pause");
+      if (state.playback) state.playback.paused = true;
+      return "Playback paused.";
+    },
+  });
+
+  rc.addTool({
+    name: "resume_playback",
+    description: "Resume paused TTS playback from where it stopped.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => {
+      sendControlFromRC("resume");
+      if (state.playback) state.playback.paused = false;
+      return "Playback resumed.";
+    },
+  });
+
+  rc.addTool({
+    name: "stop_playback",
+    description: "Stop TTS playback completely and clear the audio queue.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => {
+      sendControlFromRC("stop");
+      if (state.playback) { state.playback.paused = false; state.playback.currentJobId = null; }
+      return "Playback stopped and queue cleared.";
+    },
+  });
+
+  rc.addTool({
+    name: "restart_playback",
+    description: "Restart the current TTS item from the beginning.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => {
+      sendControlFromRC("restart");
+      if (state.playback) state.playback.paused = false;
+      return "Restarting current item from beginning.";
+    },
+  });
+
+  rc.addTool({
+    name: "next_item",
+    description: "Skip to the next queued TTS item.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => {
+      sendControlFromRC("next");
+      return "Skipped to next item.";
+    },
+  });
+
+  rc.addTool({
+    name: "previous_item",
+    description: "Go back to the previous TTS item and replay it.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => {
+      sendControlFromRC("previous");
+      return "Rewound to previous item.";
+    },
+  });
+
+  rc.addTool({
+    name: "start_at",
+    description: "Jump to a specific sentence index within the current TTS item.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        index: { type: "number", description: "Sentence index to start from (0-based)" },
+      },
+      required: ["index"],
+    },
+    handler: async ({ index }) => {
+      if (typeof index !== "number" || index < 0) return "Error: index must be a non-negative number";
+      sendControlFromRC("start_at", { index });
+      return `Jumping to sentence index ${index}.`;
     },
   });
 

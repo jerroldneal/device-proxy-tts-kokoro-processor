@@ -15,13 +15,37 @@ import { startReverseClient } from "./kokoro-reverse-client.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const processorPath = path.join(__dirname, "processor.py");
 
+// Path Translation: container paths ↔ host paths
+const CONTAINER_DATA_PREFIX = "/app/data";
+const MP3_HOST_PREFIX = process.env.MP3_HOST_PREFIX || "~/.tts";
+
+function containerToHostPath(containerPath) {
+  if (!containerPath) return containerPath;
+  if (containerPath.startsWith(CONTAINER_DATA_PREFIX)) {
+    return MP3_HOST_PREFIX + containerPath.slice(CONTAINER_DATA_PREFIX.length);
+  }
+  return containerPath;
+}
+
+function hostToContainerPath(hostPath) {
+  if (!hostPath) return hostPath;
+  if (hostPath.startsWith(MP3_HOST_PREFIX)) {
+    return CONTAINER_DATA_PREFIX + hostPath.slice(MP3_HOST_PREFIX.length);
+  }
+  return hostPath;
+}
+
 // State Management
 const state = {
   status: "initializing",
   current_text: "",
   current_voice: "af_heart",
   default_voice: "af_heart",
-  history: []
+  history: [],
+  // Job tracking for MP3 combine and progress notifications
+  jobs: new Map(),
+  // Playback control state
+  playback: { paused: false, currentJobId: null, currentIndex: 0 }
 };
 
 // Spawn the Python processor GLOBALLY
@@ -53,7 +77,6 @@ python.on("close", (code) => {
 
 function handlePythonMessage(msg) {
   if (msg.type === "status") {
-    // If we receive "ready", we transition to "idle"
     if (msg.state === "ready") {
       state.status = "idle";
     } else {
@@ -65,11 +88,63 @@ function handlePythonMessage(msg) {
     } else {
       state.current_text = "";
     }
-    broadcast({ type: "status", data: state });
+    broadcast({ type: "status", data: getPublicState() });
+  } else if (msg.type === "progress") {
+    // Progress from Python: { type: "progress", jobId, percent, phase, detail }
+    const job = state.jobs.get(msg.jobId);
+    if (job) {
+      job.percent = msg.percent || 0;
+      job.phase = msg.phase || job.phase;
+      job.detail = msg.detail || "";
+    }
+    broadcast({ type: "progress", jobId: msg.jobId, percent: msg.percent, phase: msg.phase, detail: msg.detail });
+  } else if (msg.type === "mp3_complete") {
+    // Single MP3 part completed — update combine job if applicable
+    const job = state.jobs.get(msg.jobId);
+    if (job && job.type === "combine") {
+      job.completedParts = (job.completedParts || 0) + 1;
+      job.percent = Math.round((job.completedParts / job.totalParts) * 100);
+      broadcast({ type: "progress", jobId: msg.jobId, percent: job.percent, phase: "generating", detail: `Part ${job.completedParts}/${job.totalParts}` });
+      // Check if all parts done — trigger combine
+      if (job.completedParts >= job.totalParts) {
+        combineMp3Parts(job);
+      }
+    }
   } else if (msg.type === "error") {
     console.error("Python Error:", msg.message);
     broadcast({ type: "error", message: msg.message });
   }
+}
+
+function getPublicState() {
+  const jobs = [];
+  for (const [id, job] of state.jobs) {
+    jobs.push({ id, type: job.type, status: job.status, percent: job.percent, phase: job.phase, outputPath: containerToHostPath(job.outputPath) });
+  }
+  return {
+    status: state.status,
+    current_text: state.current_text,
+    current_voice: state.current_voice,
+    default_voice: state.default_voice,
+    playback: state.playback,
+    activeJobs: jobs
+  };
+}
+
+async function combineMp3Parts(job) {
+  job.phase = "combining";
+  job.status = "combining";
+  broadcast({ type: "progress", jobId: job.id, percent: 95, phase: "combining", detail: "Concatenating parts" });
+
+  // Send combine command to Python
+  const combinePayload = {
+    type: "combine_mp3",
+    jobId: job.id,
+    partPaths: job.partPaths,
+    outputPath: job.outputPath,
+    cleanupParts: job.cleanupParts !== false
+  };
+  python.stdin.write(JSON.stringify(combinePayload) + "\n");
 }
 
 function addToHistory(item) {
@@ -93,7 +168,8 @@ async function speakToolHandler({ text, voice, speed, mp3, mp3_path, mp3announce
   const selectedSpeed = speed || 1.0;
   const id = uuidv4();
 
-  let resolvedMp3Path = mp3_path || null;
+  // Translate host path to container path if needed
+  let resolvedMp3Path = mp3_path ? hostToContainerPath(mp3_path) : null;
   if (mp3 && !resolvedMp3Path) {
     const mp3Dir = "/app/data/mp3";
     fs.mkdirSync(mp3Dir, { recursive: true });
@@ -108,7 +184,9 @@ async function speakToolHandler({ text, voice, speed, mp3, mp3_path, mp3announce
   try {
     python.stdin.write(JSON.stringify(payload) + "\n");
     console.log("[MCP] Request written to Python stdin");
-    const resultText = mp3 ? `MP3 will be saved to ${resolvedMp3Path}` : "Request sent to processor";
+    // Return host-visible path to caller
+    const hostPath = containerToHostPath(resolvedMp3Path);
+    const resultText = mp3 ? `MP3 will be saved to ${hostPath}` : "Request sent to processor";
     return { content: [{ type: "text", text: resultText }] };
   } catch (error) {
     console.error(`[MCP] Error writing to Python: ${error.message}`);
@@ -116,10 +194,201 @@ async function speakToolHandler({ text, voice, speed, mp3, mp3_path, mp3announce
   }
 }
 
+function sendControl(command, params = {}) {
+  const msg = { type: "control", command, ...params };
+  python.stdin.write(JSON.stringify(msg) + "\n");
+}
+
 function createMcpServer() {
-  const server = new McpServer({ name: "tts-kokoro-processor-mcp", version: "1.0.0" });
+  const server = new McpServer({ name: "tts-kokoro-processor-mcp", version: "2.0.0" });
   server.tool("speak", speakToolParams, speakToolHandler);
+
+  // ── MP3 Combine Tool ──
+  server.tool("speak_mp3_combined", {
+    text: z.string().describe("The full text to convert to a combined MP3. Long texts are automatically split into sections."),
+    voice: z.string().optional().describe("Voice ID (default: current default voice)"),
+    speed: z.number().optional().describe("Speed of speech (default: 1.0)"),
+    mp3_path: z.string().optional().describe("Output path for the final combined MP3 (host path, auto-generated if omitted)"),
+    max_chars_per_section: z.number().optional().describe("Maximum characters per section before splitting (default: 5000)"),
+    cleanup_parts: z.boolean().optional().describe("Remove individual part files after combining (default: true)"),
+  }, async ({ text, voice, speed, mp3_path, max_chars_per_section, cleanup_parts }) => {
+    const maxChars = max_chars_per_section || 5000;
+    const sections = splitTextIntoSections(text, maxChars);
+    const jobId = uuidv4();
+    const selectedVoice = voice || state.default_voice;
+    const selectedSpeed = speed || 1.0;
+
+    // Resolve output path
+    let containerOutputPath = mp3_path ? hostToContainerPath(mp3_path) : null;
+    if (!containerOutputPath) {
+      const mp3Dir = "/app/data/mp3";
+      fs.mkdirSync(mp3Dir, { recursive: true });
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      containerOutputPath = path.join(mp3Dir, `tts-combined-${timestamp}.mp3`);
+    }
+
+    // Generate part paths
+    const baseName = containerOutputPath.replace(/\.mp3$/i, "");
+    const partPaths = sections.map((_, i) => `${baseName}-part-${String(i + 1).padStart(3, "0")}.mp3`);
+
+    // Register job
+    const job = {
+      id: jobId,
+      type: "combine",
+      status: "generating",
+      totalParts: sections.length,
+      completedParts: 0,
+      percent: 0,
+      phase: "generating",
+      partPaths,
+      outputPath: containerOutputPath,
+      cleanupParts: cleanup_parts !== false,
+      createdAt: new Date().toISOString()
+    };
+    state.jobs.set(jobId, job);
+
+    // Queue each section as a separate MP3 generation
+    for (let i = 0; i < sections.length; i++) {
+      const partPayload = {
+        id: uuidv4(),
+        jobId,
+        text: sections[i],
+        voice: selectedVoice,
+        speed: selectedSpeed,
+        mp3: true,
+        mp3_path: partPaths[i],
+        mp3announce: false
+      };
+      addToHistory({ ...partPayload, timestamp: new Date().toISOString() });
+      python.stdin.write(JSON.stringify(partPayload) + "\n");
+    }
+
+    const hostOutputPath = containerToHostPath(containerOutputPath);
+    return {
+      content: [{
+        type: "text",
+        text: `MP3 combine job started (${jobId}). ${sections.length} section(s) queued. Output: ${hostOutputPath}. Use get_job_status to track progress.`
+      }]
+    };
+  });
+
+  // ── Job Status Tool ──
+  server.tool("get_job_status", {
+    job_id: z.string().optional().describe("Job ID to check (omit for all active jobs)"),
+  }, async ({ job_id }) => {
+    if (job_id) {
+      const job = state.jobs.get(job_id);
+      if (!job) return { content: [{ type: "text", text: `Job "${job_id}" not found.` }] };
+      return { content: [{ type: "text", text: JSON.stringify({ ...job, outputPath: containerToHostPath(job.outputPath) }, null, 2) }] };
+    }
+    const all = [];
+    for (const [id, job] of state.jobs) {
+      all.push({ id, type: job.type, status: job.status, percent: job.percent, phase: job.phase, outputPath: containerToHostPath(job.outputPath) });
+    }
+    return { content: [{ type: "text", text: all.length ? JSON.stringify(all, null, 2) : "No active jobs." }] };
+  });
+
+  // ── Notification / Progress Tool ──
+  server.tool("get_notifications", {}, async () => {
+    const status = state.status;
+    const jobs = [];
+    for (const [id, job] of state.jobs) {
+      jobs.push({ id, type: job.type, status: job.status, percent: job.percent, phase: job.phase });
+    }
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          processorStatus: status,
+          playback: state.playback,
+          activeJobs: jobs,
+          defaultVoice: state.default_voice
+        }, null, 2)
+      }]
+    };
+  });
+
+  // ── Playback Controls ──
+  server.tool("pause", {}, async () => {
+    sendControl("pause");
+    state.playback.paused = true;
+    broadcast({ type: "status", data: getPublicState() });
+    return { content: [{ type: "text", text: "Playback paused." }] };
+  });
+
+  server.tool("resume", {}, async () => {
+    sendControl("resume");
+    state.playback.paused = false;
+    broadcast({ type: "status", data: getPublicState() });
+    return { content: [{ type: "text", text: "Playback resumed." }] };
+  });
+
+  server.tool("stop", {}, async () => {
+    sendControl("stop");
+    state.playback.paused = false;
+    state.playback.currentJobId = null;
+    broadcast({ type: "status", data: getPublicState() });
+    return { content: [{ type: "text", text: "Playback stopped and queue cleared." }] };
+  });
+
+  server.tool("restart", {}, async () => {
+    sendControl("restart");
+    state.playback.paused = false;
+    broadcast({ type: "status", data: getPublicState() });
+    return { content: [{ type: "text", text: "Restarting current item from beginning." }] };
+  });
+
+  server.tool("next", {}, async () => {
+    sendControl("next");
+    return { content: [{ type: "text", text: "Skipped to next item." }] };
+  });
+
+  server.tool("previous", {}, async () => {
+    sendControl("previous");
+    return { content: [{ type: "text", text: "Rewound to previous item." }] };
+  });
+
+  server.tool("start_at", {
+    index: z.number().describe("The sentence index to start playback from (0-based)"),
+  }, async ({ index }) => {
+    sendControl("start_at", { index });
+    return { content: [{ type: "text", text: `Jumping to sentence index ${index}.` }] };
+  });
+
   return server;
+}
+
+// Split long text into sections at sentence/paragraph boundaries
+function splitTextIntoSections(text, maxChars) {
+  if (text.length <= maxChars) return [text];
+
+  const sections = [];
+  // First try splitting on paragraph boundaries
+  const paragraphs = text.split(/\n\s*\n/).filter(p => p.trim().length > 0);
+  let current = "";
+
+  for (const para of paragraphs) {
+    if (current.length + para.length + 2 > maxChars && current.length > 0) {
+      sections.push(current.trim());
+      current = "";
+    }
+    // If a single paragraph exceeds maxChars, split at sentence boundaries
+    if (para.length > maxChars) {
+      if (current.length > 0) { sections.push(current.trim()); current = ""; }
+      const sentences = para.split(/(?<=[.!?])\s+/);
+      for (const sentence of sentences) {
+        if (current.length + sentence.length + 1 > maxChars && current.length > 0) {
+          sections.push(current.trim());
+          current = "";
+        }
+        current += (current ? " " : "") + sentence;
+      }
+    } else {
+      current += (current ? "\n\n" : "") + para;
+    }
+  }
+  if (current.trim().length > 0) sections.push(current.trim());
+  return sections.length > 0 ? sections : [text];
 }
 
 const app = express();
@@ -135,8 +404,8 @@ app.post("/api/speak", jsonParser, (req, res) => {
 
   const id = uuidv4();
 
-  // Auto-generate mp3_path if mp3 mode requested without a path
-  let resolvedMp3Path = mp3_path || null;
+  // Translate host path to container path if needed; auto-generate if omitted
+  let resolvedMp3Path = mp3_path ? hostToContainerPath(mp3_path) : null;
   if (mp3 && !resolvedMp3Path) {
     const mp3Dir = "/app/data/mp3";
     fs.mkdirSync(mp3Dir, { recursive: true });
@@ -169,12 +438,19 @@ app.get("/api/status", (req, res) => res.json(state));
 app.get("/api/history", (req, res) => res.json(state.history));
 
 app.post("/api/control", jsonParser, (req, res) => {
-  const { command, voice } = req.body;
+  const { command, voice, index } = req.body;
   if (command === "set_voice") {
     state.default_voice = voice;
-    broadcast({ type: "status", data: state });
+    broadcast({ type: "status", data: getPublicState() });
+  } else if (["pause", "resume", "stop", "restart", "next", "previous"].includes(command)) {
+    sendControl(command);
+    if (command === "pause") state.playback.paused = true;
+    if (command === "resume") state.playback.paused = false;
+    if (command === "stop") { state.playback.paused = false; state.playback.currentJobId = null; }
+    broadcast({ type: "status", data: getPublicState() });
+  } else if (command === "start_at" && typeof index === "number") {
+    sendControl("start_at", { index });
   }
-  // TODO: Implement stop command (requires Python support)
   res.json({ success: true });
 });
 

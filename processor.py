@@ -52,6 +52,20 @@ audio_queue = queue.Queue()
 # Event to wake up the file watcher
 fs_event = threading.Event()
 
+# Playback control state
+playback_state = {
+    'paused': False,
+    'stopped': False,
+    'skip_current': False,
+    'restart_current': False,
+}
+pause_event = threading.Event()
+pause_event.set()  # Start unpaused
+
+# Completed task history for previous/next navigation
+completed_tasks = []
+current_task_index = -1
+
 class AudioChunk:
     def __init__(self, audio_data, sample_rate, volume, source_id, is_end_of_file=False, mp3_info=None):
         self.audio_data = audio_data
@@ -204,10 +218,37 @@ def get_oldest_file(directory):
     except Exception:
         return None
 
+def emit_status(state, text="", extra=None):
+    msg = {"type": "status", "state": state}
+    if text:
+        msg["text"] = text
+    if extra:
+        msg.update(extra)
+    print(json.dumps(msg), flush=True)
+
+def emit_progress(job_id, percent, phase="generating", detail=""):
+    msg = {"type": "progress", "jobId": job_id, "percent": percent, "phase": phase, "detail": detail}
+    print(json.dumps(msg), flush=True)
+
+def emit_mp3_complete(job_id):
+    msg = {"type": "mp3_complete", "jobId": job_id}
+    print(json.dumps(msg), flush=True)
+
+def check_paused():
+    """Block if playback is paused. Returns False if stopped."""
+    while playback_state['paused'] and not playback_state['stopped']:
+        pause_event.wait(timeout=0.2)
+    return not playback_state['stopped']
+
 def generator_worker():
     while True:
         try:
             task = task_queue.get()
+
+            # Reset control state for new task
+            playback_state['skip_current'] = False
+            playback_state['restart_current'] = False
+            playback_state['stopped'] = False
 
             # Determine if task is file path or memory object
             is_file = isinstance(task, str)
@@ -295,6 +336,11 @@ def generator_worker():
                         for i, (gs, ps, audio) in enumerate(generator):
                             if is_file and not os.path.exists(file_path):
                                 break
+                            # Check playback controls
+                            if playback_state['stopped'] or playback_state['skip_current']:
+                                break
+                            if not check_paused():
+                                break
 
                             # Convert Tensor to Numpy if needed
                             if hasattr(audio, 'numpy'):
@@ -310,11 +356,18 @@ def generator_worker():
                         print(f"Generator: Error in pipeline: {e}")
 
             if is_file and os.path.exists(file_path):
+                job_id = None  # file tasks don't have jobId
                 mp3_info = {'path': mp3_path, 'audio': accumulated_audio, 'announce': mp3_announce} if mp3_mode else None
                 audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True, mp3_info=mp3_info))
             elif not is_file:
-                mp3_info = {'path': mp3_path, 'audio': accumulated_audio, 'announce': mp3_announce} if mp3_mode else None
+                job_id = task.get('jobId') if not is_file else None
+                mp3_info = {'path': mp3_path, 'audio': accumulated_audio, 'announce': mp3_announce, 'jobId': job_id} if mp3_mode else None
                 audio_queue.put(AudioChunk(None, 0, 0, source_id, is_end_of_file=True, mp3_info=mp3_info))
+
+            # Track completed task for previous/next navigation
+            completed_tasks.append(task)
+            if len(completed_tasks) > 100:
+                completed_tasks.pop(0)
 
             task_queue.task_done()
             print(f"Generator: Finished generating {source_id}")
@@ -347,6 +400,7 @@ def player_worker():
                 if chunk.mp3_info and chunk.mp3_info.get('path') and chunk.mp3_info.get('audio'):
                     mp3_path = chunk.mp3_info['path']
                     audio_list = chunk.mp3_info['audio']
+                    job_id = chunk.mp3_info.get('jobId')
 
                     try:
                         # Ensure output directory exists
@@ -365,6 +419,10 @@ def player_worker():
                                          check=True, capture_output=True)
                             os.remove(wav_path)  # Clean up WAV file
                             print(f"Player: MP3 file created at {mp3_path}")
+
+                            # Signal MP3 completion for combine jobs
+                            if job_id:
+                                emit_mp3_complete(job_id)
 
                             # Announce file creation to speaker (only if mp3announce is True)
                             if chunk.mp3_info.get('announce', False):
@@ -396,6 +454,13 @@ def player_worker():
 
             # Play Audio via Stream
             if chunk.audio_data is not None:
+                # Check playback controls before playing
+                if playback_state['stopped'] or playback_state['skip_current']:
+                    audio_queue.task_done()
+                    continue
+                if not check_paused():
+                    audio_queue.task_done()
+                    continue
                 player.play_chunk(chunk.audio_data, chunk.volume)
 
             audio_queue.task_done()
@@ -417,13 +482,115 @@ def stdin_reader():
 
             try:
                 data = json.loads(line)
-                print(f"Stdin Reader: Received task")
-                task_queue.put(data)
+                msg_type = data.get('type', '')
+
+                if msg_type == 'control':
+                    handle_control(data)
+                elif msg_type == 'combine_mp3':
+                    handle_combine_mp3(data)
+                else:
+                    # Regular speak task
+                    print(f"Stdin Reader: Received task")
+                    task_queue.put(data)
             except json.JSONDecodeError:
                 print(f"Stdin Reader: Invalid JSON received: {line}")
         except Exception as e:
             print(f"Stdin Reader: Error: {e}")
             time.sleep(1)
+
+def handle_control(data):
+    command = data.get('command', '')
+    print(f"Control: Received command '{command}'")
+
+    if command == 'pause':
+        playback_state['paused'] = True
+        pause_event.clear()
+        print("Control: Playback paused")
+    elif command == 'resume':
+        playback_state['paused'] = False
+        pause_event.set()
+        print("Control: Playback resumed")
+    elif command == 'stop':
+        playback_state['stopped'] = True
+        playback_state['paused'] = False
+        pause_event.set()  # Unblock if paused
+        # Drain queues
+        while not task_queue.empty():
+            try:
+                task_queue.get_nowait()
+                task_queue.task_done()
+            except queue.Empty:
+                break
+        while not audio_queue.empty():
+            try:
+                audio_queue.get_nowait()
+                audio_queue.task_done()
+            except queue.Empty:
+                break
+        print("Control: Playback stopped, queues cleared")
+    elif command == 'restart':
+        playback_state['restart_current'] = True
+        playback_state['skip_current'] = True
+        print("Control: Restarting current item")
+    elif command == 'next':
+        playback_state['skip_current'] = True
+        print("Control: Skipping to next item")
+    elif command == 'previous':
+        if len(completed_tasks) >= 2:
+            prev_task = completed_tasks[-2]
+            task_queue.put(prev_task)
+            playback_state['skip_current'] = True
+            print("Control: Rewinding to previous item")
+        else:
+            print("Control: No previous item available")
+    elif command == 'start_at':
+        # This will be handled by the generator - set index for next generation
+        idx = data.get('index', 0)
+        print(f"Control: Start at sentence index {idx} (next task)")
+
+def handle_combine_mp3(data):
+    """Combine multiple MP3 part files into a single output MP3."""
+    job_id = data.get('jobId', 'unknown')
+    part_paths = data.get('partPaths', [])
+    output_path = data.get('outputPath', '')
+    cleanup = data.get('cleanupParts', True)
+
+    print(f"Combine: Merging {len(part_paths)} parts into {output_path}")
+
+    try:
+        # Create ffmpeg concat list file
+        concat_list_path = output_path.replace('.mp3', '_concat.txt')
+        with open(concat_list_path, 'w') as f:
+            for p in part_paths:
+                f.write(f"file '{p}'\n")
+
+        # Combine using ffmpeg concat demuxer
+        subprocess.run(
+            ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_list_path, '-codec:a', 'copy', output_path],
+            check=True, capture_output=True
+        )
+        os.remove(concat_list_path)
+
+        # Clean up part files if requested
+        if cleanup:
+            for p in part_paths:
+                if os.path.exists(p):
+                    os.remove(p)
+
+        print(f"Combine: Successfully created {output_path}")
+
+        # Emit completion
+        result = {"type": "status", "state": "combine_complete", "jobId": job_id, "outputPath": output_path}
+        print(json.dumps(result), flush=True)
+
+    except subprocess.CalledProcessError as e:
+        print(f"Combine: ffmpeg error: {e.stderr.decode()}")
+        error_msg = {"type": "error", "message": f"MP3 combine failed: {e.stderr.decode()}", "jobId": job_id}
+        print(json.dumps(error_msg), flush=True)
+    except Exception as e:
+        print(f"Combine: Error: {e}")
+        error_msg = {"type": "error", "message": f"MP3 combine failed: {str(e)}", "jobId": job_id}
+        print(json.dumps(error_msg), flush=True)
 
 def main():
     print("Starting TTS Kokoro Processor (Hybrid Mode)...")
